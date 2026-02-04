@@ -1,0 +1,28 @@
+name: Ruff
+
+on:
+  push:
+    paths:
+      - '.github/workflows/ruff.yml'
+      - 'pyproject.toml'
+      - '**.py'
+  pull_request:
+    paths:
+      - '.github/workflows/ruff.yml'
+      - 'pyproject.toml'
+      - '**.py'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+    - uses: astral-sh/ruff-action@v3
+      with:
+        args: '--version'
+    - name: Ruff check
+      run: |
+        ruff check
+    - name: Ruff format
+      run: |
+        ruff format --check --diff

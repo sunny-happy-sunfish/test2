@@ -1,0 +1,2 @@
+class NoOpponentError(Exception):
+    pass
