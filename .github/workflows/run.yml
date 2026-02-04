@@ -27,16 +27,8 @@ jobs:
       - name: Token
         run: sed -i "s/litoken_idk/${{ secrets.TOKEN }}/g" config.yml
 
-      - name: get sf
-        run: |
-          curl -sSL https://raw.githubusercontent.com/ppigazzini/stockfish-downloader/main/posix_helper.sh | sh -s
-          tar -xf stockfish-*.tar
-          rm stockfish-*.tar
-          mv -f stockfish/stockfish-* engines/stockfish
-          rm -r stockfish
-        
       - name: chmod
-        run: chmod +x ./engines/strawberry.py
+        run: chmod +x ./engines/s.py
         
       - name: Run bot
         run: |
