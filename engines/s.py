@@ -76,6 +76,7 @@ USE_FUTILITY = True      # Soft futility at depth 1 only; only when not in check
 USE_LMR_STRICT = True    # LMR: only quiet, depth>=3, skip first 2 moves, no check/promo, max reduction 2
 QSEARCH_MAX_PLY = 8      # Max quiescence depth (promo/checks) to avoid check cycles; 0 = no limit on checks
 COUNTER_BONUS = 400_000  # Counter-move ordering bonus (weak; must stay below TT/captures)
+DISABLE_FORCING_FILTER = False  # If True: skip anti-blunder ordering (opponent has simple check/capture reply)
 
 PIECE_SYMBOLS = {
     (WHITE, PAWN): "P",
@@ -1258,6 +1259,19 @@ def hang_penalty_for_color(board: Board, color):
     return total
 
 
+def get_hanging_squares(board: Board, color):
+    """Set of squares where color has a piece (N,B,R,Q) that is attacked and not defended. For blunder ordering."""
+    opp = 1 - color
+    out = set()
+    for p in (KNIGHT, BISHOP, ROOK, QUEEN):
+        bb = board.bb[color][p]
+        while bb:
+            sq, bb = pop_lsb(bb)
+            if min_attacker_value(board, sq, opp) < 10_000_000 and not get_attackers(board, sq, color):
+                out.add(sq)
+    return out
+
+
 def bad_capture_ordering_penalty(board: Board, to_sq, our_piece_value, opp_color):
     """
     SEE-lite for root capture ordering only. Board is *after* our capture (our piece on to_sq, opp to move).
@@ -1695,6 +1709,12 @@ class Searcher:
         phase = board.phase
         order_board = getattr(self, "order_board", None)
         stm = board.side_to_move
+        # For blunder ordering: squares where we have a hanging piece (N,B,R,Q) before any move
+        hanging_before = (
+            get_hanging_squares(board, stm)
+            if (depth >= 2 and root and not in_check(board))
+            else set()
+        )
 
         def move_score(m):
             score = 0
@@ -1728,10 +1748,61 @@ class Searcher:
                 score += self.history_heur[(stm, m.from_sq, m.to_sq)]
             # Move filtering (ordering): avoid moves that leave pieces en prise when alternatives exist.
             # Only at root, when not in check; heuristic-based. Penalty tries "safe" moves first.
-            # SEE-lite: demote captures that can be recaptured by a cheaper piece (bad captures).
+            # Blunder filter (depth>=2, quiet only): king attacked or newly hanging piece -> strong penalty (move to end).
             if root and order_board is not None and not in_check(board):
                 if make_move(order_board, m):
                     us = 1 - order_board.side_to_move
+                    if depth >= 2 and m.is_quiet() and not m.is_capture() and not (m.flags & Move.CASTLE):
+                        king_sq = lsb(order_board.bb[us][KING])
+                        if king_sq != -1 and is_square_attacked(order_board, king_sq, order_board.side_to_move):
+                            score -= 5_000_000
+                        else:
+                            hanging_after = get_hanging_squares(order_board, us)
+                            newly = set()
+                            for sq in hanging_after:
+                                if sq == m.to_sq:
+                                    if m.from_sq not in hanging_before:
+                                        newly.add(sq)
+                                else:
+                                    if sq not in hanging_before:
+                                        newly.add(sq)
+                            if newly:
+                                score -= 3_000_000
+                    # Anti-blunder ordering: if opponent has a simple forcing reply (check or good capture >= knight), penalise (no pruning)
+                    if (
+                            not DISABLE_FORCING_FILTER
+                            and depth >= 2
+                            and m.is_quiet()
+                            and not m.is_capture()
+                            and not (m.flags & Move.CASTLE)
+                    ):
+                        has_forcing = False
+                        for opp_move in gen_moves(order_board):
+                            if opp_move.is_capture():
+                                victim_piece = None
+                                for p in range(6):
+                                    if bit(opp_move.to_sq) & order_board.bb[us][p]:
+                                        victim_piece = p
+                                        break
+                                if victim_piece is not None and PIECE_VALUES_MG[victim_piece] >= PIECE_VALUES_MG[KNIGHT]:
+                                    att = opp_move.piece
+                                    if att is None:
+                                        for p in range(6):
+                                            if bit(opp_move.from_sq) & order_board.bb[order_board.side_to_move][p]:
+                                                att = p
+                                                break
+                                    if att is not None and PIECE_VALUES_MG[att] <= PIECE_VALUES_MG[victim_piece] + 50:
+                                        has_forcing = True
+                                        break
+                            else:
+                                if make_move(order_board, opp_move):
+                                    if in_check(order_board):
+                                        has_forcing = True
+                                    undo_move(order_board)
+                                    if has_forcing:
+                                        break
+                        if has_forcing:
+                            score -= 2_000_000
                     penalty = hang_penalty_for_color(order_board, us)
                     if m.is_capture() and not (m.flags & Move.CASTLE) and not in_check(order_board):
                         if m.promo is not None:
@@ -1787,6 +1858,11 @@ class Searcher:
         in_check_before = in_check(board)
         current_eval_for_futility = eval_board(board) if (USE_FUTILITY and depth == 1) else None
         current_eval_for_lmr = eval_board(board) if (USE_LMR_STRICT and depth >= 3) else None
+        king_attackers = 0
+        if USE_LMR_STRICT and depth >= 3:
+            ksq = lsb(board.bb[stm][KING])
+            if ksq != -1:
+                king_attackers = len(get_attackers(board, ksq, 1 - stm))
 
         # Soft futility: only depth 1, not in check, eval >= -150; margin 80 cp (defensive positions: don't prune)
         FUTILITY_MARGIN = 80
@@ -1831,14 +1907,15 @@ class Searcher:
                     undo_move(board)
                     continue
 
-            # LMR: forbid reduction on defensive moves (eval < -100, in check, king move, or moving attacked piece)
+            # LMR: forbid reduction in dangerous positions (eval < -50, in check, king move, attacked piece, or king has >=2 attackers)
             no_lmr_defensive = (
                     USE_LMR_STRICT
                     and (
-                            (current_eval_for_lmr is not None and current_eval_for_lmr < -100)
+                            (current_eval_for_lmr is not None and current_eval_for_lmr < -50)
                             or in_check_before
                             or (m.piece == KING)
                             or was_attacked
+                            or king_attackers >= 2
                     )
             )
             do_lmr = (
@@ -1921,6 +1998,11 @@ class Searcher:
         if self.time_up():
             return 0
         self.nodes += 1
+        # Mate-in-1: if side is in check and has no legal move, return mate (no search extension)
+        if in_check(board):
+            legal = gen_moves(board)
+            if not legal:
+                return -MATE_VALUE + ply
         stand_pat = eval_board(board)
         if stand_pat >= beta:
             return beta
