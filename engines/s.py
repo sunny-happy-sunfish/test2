@@ -77,6 +77,7 @@ USE_LMR_STRICT = True    # LMR: only quiet, depth>=3, skip first 2 moves, no che
 QSEARCH_MAX_PLY = 8      # Max quiescence depth (promo/checks) to avoid check cycles; 0 = no limit on checks
 COUNTER_BONUS = 400_000  # Counter-move ordering bonus (weak; must stay below TT/captures)
 DISABLE_FORCING_FILTER = False  # If True: skip anti-blunder ordering (opponent has simple check/capture reply)
+USE_STRONG_PIECE_PROTECTION = True  # If True: avoid quiet moves that leave R/B/Q hanging (root ordering + quiescence)
 
 PIECE_SYMBOLS = {
     (WHITE, PAWN): "P",
@@ -1768,6 +1769,12 @@ class Searcher:
                                         newly.add(sq)
                             if newly:
                                 score -= 3_000_000
+                    # Strong piece protection: avoid unnecessary loss of R/B/Q (ordering only; no pruning)
+                    if USE_STRONG_PIECE_PROTECTION and depth >= 2 and m.is_quiet() and not (m.flags & Move.CASTLE):
+                        hanging_sp = get_hanging_squares(order_board, us)
+                        strong_bb = order_board.bb[us][ROOK] | order_board.bb[us][BISHOP] | order_board.bb[us][QUEEN]
+                        if any(bit(sq) & strong_bb for sq in hanging_sp):
+                            score -= 5_000_000
                     # Anti-blunder ordering: if opponent has a simple forcing reply (check or good capture >= knight), penalise (no pruning)
                     if (
                             not DISABLE_FORCING_FILTER
@@ -2004,6 +2011,17 @@ class Searcher:
             if not legal:
                 return -MATE_VALUE + ply
         stand_pat = eval_board(board)
+        # Strong piece protection: avoid unnecessary loss of R/B/Q — reduce stand_pat if we have hanging R/B/Q
+        if USE_STRONG_PIECE_PROTECTION and not in_check(board):
+            stm = board.side_to_move
+            hanging = get_hanging_squares(board, stm)
+            strong_bb = board.bb[stm][ROOK] | board.bb[stm][BISHOP] | board.bb[stm][QUEEN]
+            for sq in hanging:
+                if bit(sq) & strong_bb:
+                    for p in (ROOK, BISHOP, QUEEN):
+                        if bit(sq) & board.bb[stm][p]:
+                            stand_pat -= PIECE_VALUES_MG[p]
+                            break
         if stand_pat >= beta:
             return beta
         if stand_pat > alpha:
