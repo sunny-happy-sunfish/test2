@@ -78,6 +78,10 @@ QSEARCH_MAX_PLY = 8      # Max quiescence depth (promo/checks) to avoid check cy
 COUNTER_BONUS = 400_000  # Counter-move ordering bonus (weak; must stay below TT/captures)
 DISABLE_FORCING_FILTER = False  # If True: skip anti-blunder ordering (opponent has simple check/capture reply)
 USE_STRONG_PIECE_PROTECTION = True  # If True: avoid quiet moves that leave R/B/Q hanging (root ordering + quiescence)
+USE_ROOT_BLUNDER_SHIELD = True  # If True: root-level safety filter against obvious material blunders
+ROOT_BLUNDER_MARGIN = 180  # cp: require safer move to be clearly better to override
+ROOT_HANG_LOSS_TRIGGER = 250  # cp: minimum hanging loss to trigger shield
+ROOT_HANG_PENALTY = 1.0  # multiplier for hanging material in safety score (cp)
 
 PIECE_SYMBOLS = {
     (WHITE, PAWN): "P",
@@ -1286,6 +1290,28 @@ def bad_capture_ordering_penalty(board: Board, to_sq, our_piece_value, opp_color
     return min(100, max(20, loss // 5))
 
 
+def immediate_hang_loss(board: Board, color):
+    """
+    Sum of material (cp) for pieces that are attacked and undefended.
+    Conservative: only count if opponent has a cheaper-or-equal attacker.
+    Used for root blunder shield, not for pruning.
+    """
+    opp = 1 - color
+    total = 0
+    for p in (PAWN, KNIGHT, BISHOP, ROOK, QUEEN):
+        bb = board.bb[color][p]
+        while bb:
+            sq, bb = pop_lsb(bb)
+            if get_attackers(board, sq, color):
+                continue
+            min_att = min_attacker_value(board, sq, opp)
+            if min_att >= 10_000_000:
+                continue
+            if min_att <= PIECE_VALUES_MG[p] + 50:
+                total += PIECE_VALUES_MG[p]
+    return total
+
+
 def eval_board(board: Board):
     # positive is good for side to move (we return from POV of side_to_move later)
     # Use incremental piece sum (eval_mg, eval_eg, phase); rest computed here
@@ -1575,7 +1601,8 @@ class Searcher:
         beta = INF
         last_score = 0
         for depth in range(1, max_depth + 1):
-            if self.time_up():
+            # Always complete depth 1 so we have a real best_move and eval (avoids "push pawns, no eval" on very short time)
+            if depth > 1 and self.time_up():
                 break
             self.age += 1
             self.order_board = self.root_board.clone()
@@ -1610,14 +1637,31 @@ class Searcher:
         legal_root_moves = gen_moves(board)
         if not legal_root_moves:
             self.best_move = None
-        elif self.best_move is None or not any(
-                m.from_sq == self.best_move.from_sq
-                and m.to_sq == self.best_move.to_sq
-                and m.promo == self.best_move.promo
-                for m in legal_root_moves
-        ):
-            # Fall back to the first legal move.
-            self.best_move = legal_root_moves[0]
+        else:
+            best_is_legal = (
+                self.best_move is not None
+                and any(
+                    m.from_sq == self.best_move.from_sq
+                    and m.to_sq == self.best_move.to_sq
+                    and m.promo == self.best_move.promo
+                    for m in legal_root_moves
+                )
+            )
+            if best_is_legal:
+                self.best_move = self._root_blunder_shield(board, legal_root_moves)
+            elif self.best_move is None or not best_is_legal:
+                # Fallback: pick move with best static eval (avoid blindly playing first in list, e.g. a3).
+                best_eval = -INF
+                for m in legal_root_moves:
+                    if make_move(board, m):
+                        # Eval is for side-to-move; after our move it's opponent, so negate for root POV
+                        v = -eval_board(board)
+                        undo_move(board)
+                        if v > best_eval:
+                            best_eval = v
+                            self.best_move = m
+                if self.best_move is None:
+                    self.best_move = legal_root_moves[0]
 
         return self.best_move
 
@@ -1637,6 +1681,35 @@ class Searcher:
         if self.best_move is None:
             return []
         return [self.best_move]
+
+    def _root_blunder_shield(self, board: Board, legal_moves):
+        if not USE_ROOT_BLUNDER_SHIELD or self.best_move is None or self.time_up():
+            return self.best_move
+        best_move_key = (self.best_move.from_sq, self.best_move.to_sq, self.best_move.promo)
+        best_safety = -INF
+        best_safety_move = None
+        bm_safety = None
+        bm_loss = 0
+        for m in legal_moves:
+            if not make_move(board, m):
+                continue
+            us = 1 - board.side_to_move
+            qs = -self.quiescence(board, -INF, INF, 0)
+            loss = immediate_hang_loss(board, us)
+            safety = qs - int(ROOT_HANG_PENALTY * loss)
+            undo_move(board)
+            if safety > best_safety:
+                best_safety = safety
+                best_safety_move = m
+            if (m.from_sq, m.to_sq, m.promo) == best_move_key:
+                bm_safety = safety
+                bm_loss = loss
+        if bm_safety is None or best_safety_move is None:
+            return self.best_move
+        if bm_loss >= ROOT_HANG_LOSS_TRIGGER and best_safety >= bm_safety + ROOT_BLUNDER_MARGIN:
+            if self.root_eval < 150:
+                return best_safety_move
+        return self.best_move
 
     def negamax(self, board: Board, depth, alpha, beta, ply, root=False, allow_null=True, extended=False, prev_move=None):
         if self.time_up():
