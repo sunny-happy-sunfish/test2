@@ -82,6 +82,8 @@ USE_ROOT_BLUNDER_SHIELD = True  # If True: root-level safety filter against obvi
 ROOT_BLUNDER_MARGIN = 180  # cp: require safer move to be clearly better to override
 ROOT_HANG_LOSS_TRIGGER = 250  # cp: minimum hanging loss to trigger shield
 ROOT_HANG_PENALTY = 1.0  # multiplier for hanging material in safety score (cp)
+USE_ROOT_TRAP_SHIELD = True  # If True: root check for "defended but trapped" pieces
+ROOT_TRAP_PENALTY = 0.9  # multiplier for trapped-piece penalty (cp)
 
 PIECE_SYMBOLS = {
     (WHITE, PAWN): "P",
@@ -1305,11 +1307,67 @@ def immediate_hang_loss(board: Board, color):
             if get_attackers(board, sq, color):
                 continue
             min_att = min_attacker_value(board, sq, opp)
+            # Include king captures if legal: king adjacent and square not defended by us
+            if min_att >= 10_000_000:
+                kbb = board.bb[opp][KING]
+                if kbb:
+                    ksq = lsb(kbb)
+                    if ksq != -1 and abs((ksq & 7) - (sq & 7)) <= 1 and abs((ksq >> 3) - (sq >> 3)) <= 1:
+                        if not is_square_attacked(board, sq, color):
+                            min_att = 0
             if min_att >= 10_000_000:
                 continue
             if min_att <= PIECE_VALUES_MG[p] + 50:
                 total += PIECE_VALUES_MG[p]
     return total
+
+
+def _has_safe_escape(board: Board, color, sq):
+    """
+    True if the piece on sq for color has at least one legal move to a square
+    not attacked by the opponent.
+    """
+    orig_side = board.side_to_move
+    orig_key = board.zobrist_key
+    if orig_side != color:
+        board.side_to_move = color
+        board.zobrist_key ^= ZOBRIST_SIDE
+    safe = False
+    moves = gen_moves(board)
+    for m in moves:
+        if m.from_sq != sq:
+            continue
+        if make_move(board, m):
+            # after move, opponent to move
+            if not is_square_attacked(board, m.to_sq, 1 - color):
+                safe = True
+            undo_move(board)
+        if safe:
+            break
+    if board.side_to_move != orig_side:
+        board.side_to_move = orig_side
+        board.zobrist_key ^= ZOBRIST_SIDE
+    board.zobrist_key = orig_key
+    return safe
+
+
+def _trap_risk_after_reply(board: Board, color, sq):
+    """
+    True if opponent has a reply that attacks the piece on sq
+    and after that reply the piece has no safe escape.
+    Board is after our move (opponent to move).
+    """
+    for opp_move in gen_moves(board):
+        if not make_move(board, opp_move):
+            continue
+        # now it's our turn again
+        if bit(sq) & (board.bb[color][KNIGHT] | board.bb[color][BISHOP] | board.bb[color][ROOK] | board.bb[color][QUEEN]):
+            if is_square_attacked(board, sq, 1 - color):
+                if not _has_safe_escape(board, color, sq):
+                    undo_move(board)
+                    return True
+        undo_move(board)
+    return False
 
 
 def eval_board(board: Board):
@@ -1696,7 +1754,17 @@ class Searcher:
             us = 1 - board.side_to_move
             qs = -self.quiescence(board, -INF, INF, 0)
             loss = immediate_hang_loss(board, us)
-            safety = qs - int(ROOT_HANG_PENALTY * loss)
+            trap_loss = 0
+            if USE_ROOT_TRAP_SHIELD:
+                moved_piece = m.promo if m.promo is not None else m.piece
+                if moved_piece in (KNIGHT, BISHOP, ROOK, QUEEN):
+                    if bit(m.to_sq) & board.bb[us][moved_piece]:
+                        if is_square_attacked(board, m.to_sq, board.side_to_move):
+                            if not _has_safe_escape(board, us, m.to_sq):
+                                trap_loss = PIECE_VALUES_MG[moved_piece]
+                        elif _trap_risk_after_reply(board, us, m.to_sq):
+                            trap_loss = PIECE_VALUES_MG[moved_piece]
+            safety = qs - int(ROOT_HANG_PENALTY * loss) - int(ROOT_TRAP_PENALTY * trap_loss)
             undo_move(board)
             if safety > best_safety:
                 best_safety = safety
