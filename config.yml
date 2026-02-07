@@ -124,7 +124,7 @@ online_moves:
 #   max_depth: 16                         # Half move max depth. (Comment this line for max depth)
 #   max_moves: 1                          # Max number of moves played from chessdb. (Comment this line for max moves)
   online_egtb:
-    enabled: false                        # Activate online endgame tablebases from Lichess.
+    enabled: true                       # Activate online endgame tablebases from Lichess.
     min_time: 5                           # Time the bot must have at least to use the online move. +10 seconds in games without increment.
     timeout: 3                            # Time the server has to respond.
 
