@@ -60,7 +60,6 @@ Why correct sacrifices are not suppressed:
   the score. Quiescence and main search still expand all moves.
 """
 
-
 WHITE, BLACK = 0, 1
 
 PAWN, KNIGHT, BISHOP, ROOK, QUEEN, KING = range(6)
@@ -161,7 +160,12 @@ class Board:
         self.fullmove_number = 1
         self.history = []  # for undo
         self.hash_history = []  # for repetition detection
+        self.hash_count = {}  # O(1) repetition: count of each key in history
         self.zobrist_key = 0
+        # Incremental evaluation (piece sum only; eval_board adds bishop/passed/hang/king)
+        self.eval_mg = 0
+        self.eval_eg = 0
+        self.phase = 0
 
     def clone(self):
         b = Board()
@@ -175,7 +179,11 @@ class Board:
         b.fullmove_number = self.fullmove_number
         b.history = list(self.history)
         b.hash_history = list(self.hash_history)
+        b.hash_count = dict(self.hash_count)
         b.zobrist_key = self.zobrist_key
+        b.eval_mg = self.eval_mg
+        b.eval_eg = self.eval_eg
+        b.phase = self.phase
         return b
 
 
@@ -213,6 +221,25 @@ def compute_hash(board: Board):
     if board.side_to_move == BLACK:
         h ^= ZOBRIST_SIDE
     return h
+
+
+def _recompute_incremental_eval(board: Board):
+    """Full recompute of eval_mg, eval_eg, phase from current board (e.g. after set_fen)."""
+    mg = 0
+    eg = 0
+    phase = 0
+    for c in (WHITE, BLACK):
+        for p in range(6):
+            bb = board.bb[c][p]
+            while bb:
+                sq, bb = pop_lsb(bb)
+                dm, de = _piece_eval_contribution(c, p, sq)
+                mg += dm
+                eg += de
+                phase += _phase_delta(p)
+    board.eval_mg = mg
+    board.eval_eg = eg
+    board.phase = max(0, min(24, phase))
 
 
 def set_fen(board: Board, fen: str):
@@ -260,6 +287,8 @@ def set_fen(board: Board, fen: str):
     board.zobrist_key = compute_hash(board)
     board.history.clear()
     board.hash_history = [board.zobrist_key]
+    board.hash_count = {board.zobrist_key: 1}
+    _recompute_incremental_eval(board)
 
 
 START_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
@@ -346,7 +375,7 @@ def gen_moves(board: Board, captures_only=False):
                                 capture=None,
                                 promo=promo_piece,
                                 flags=Move.CAPTURE
-                                | (Move.EN_PASSANT if to == ep_sq else 0),
+                                      | (Move.EN_PASSANT if to == ep_sq else 0),
                             )
                         )
                 else:
@@ -357,7 +386,7 @@ def gen_moves(board: Board, captures_only=False):
                             PAWN,
                             capture=None,
                             flags=Move.CAPTURE
-                            | (Move.EN_PASSANT if to == ep_sq else 0),
+                                  | (Move.EN_PASSANT if to == ep_sq else 0),
                         )
                     )
         if captures_only:
@@ -434,14 +463,15 @@ def gen_moves(board: Board, captures_only=False):
             # Castling: check if king is in check and if squares are attacked
             opp = 1 - color
             king_in_check = is_square_attacked(board, sq, opp)
-            
+
             if color == WHITE:
                 if board.castling & 1:  # Kingside
                     f1 = fr_to_sq("f", "1")
                     g1 = fr_to_sq("g", "1")
                     if not (all_occ & (bit(f1) | bit(g1))):
                         # Cannot castle if in check or if squares are attacked
-                        if not king_in_check and not is_square_attacked(board, f1, opp) and not is_square_attacked(board, g1, opp):
+                        if not king_in_check and not is_square_attacked(board, f1, opp) and not is_square_attacked(
+                                board, g1, opp):
                             moves.append(
                                 Move(sq, g1, KING, flags=Move.CASTLE)
                             )
@@ -450,7 +480,8 @@ def gen_moves(board: Board, captures_only=False):
                     c1 = fr_to_sq("c", "1")
                     if not (all_occ & (bit(d1) | bit(c1))):
                         # Cannot castle if in check or if squares are attacked
-                        if not king_in_check and not is_square_attacked(board, d1, opp) and not is_square_attacked(board, c1, opp):
+                        if not king_in_check and not is_square_attacked(board, d1, opp) and not is_square_attacked(
+                                board, c1, opp):
                             moves.append(
                                 Move(sq, c1, KING, flags=Move.CASTLE)
                             )
@@ -460,7 +491,8 @@ def gen_moves(board: Board, captures_only=False):
                     g8 = fr_to_sq("g", "8")
                     if not (all_occ & (bit(f8) | bit(g8))):
                         # Cannot castle if in check or if squares are attacked
-                        if not king_in_check and not is_square_attacked(board, f8, opp) and not is_square_attacked(board, g8, opp):
+                        if not king_in_check and not is_square_attacked(board, f8, opp) and not is_square_attacked(
+                                board, g8, opp):
                             moves.append(
                                 Move(sq, g8, KING, flags=Move.CASTLE)
                             )
@@ -469,7 +501,8 @@ def gen_moves(board: Board, captures_only=False):
                     c8 = fr_to_sq("c", "8")
                     if not (all_occ & (bit(d8) | bit(c8))):
                         # Cannot castle if in check or if squares are attacked
-                        if not king_in_check and not is_square_attacked(board, d8, opp) and not is_square_attacked(board, c8, opp):
+                        if not king_in_check and not is_square_attacked(board, d8, opp) and not is_square_attacked(
+                                board, c8, opp):
                             moves.append(
                                 Move(sq, c8, KING, flags=Move.CASTLE)
                             )
@@ -493,9 +526,19 @@ def gen_moves(board: Board, captures_only=False):
     return legal
 
 
+# Light cache for is_square_attacked (one slot; often hits for king squares in search)
+_attacked_cache = [None, -1, -1, None]  # [key, sq, by_color, result]; list to allow in-place update
+
+
+def _set_attacked_cache(key, sq, by_color, result):
+    _attacked_cache[0], _attacked_cache[1], _attacked_cache[2], _attacked_cache[3] = key, sq, by_color, result
+
+
 def is_square_attacked(board: Board, sq, by_color):
     if not in_bounds(sq):
         return False
+    if _attacked_cache[0] is not None and _attacked_cache[0] == board.zobrist_key and _attacked_cache[1] == sq and _attacked_cache[2] == by_color:
+        return _attacked_cache[3]
     all_occ = board.all_occ
 
     # Pawns
@@ -504,12 +547,14 @@ def is_square_attacked(board: Board, sq, by_color):
             from_sq = sq - 8 - df
             if in_bounds(from_sq) and bit(from_sq) & board.bb[WHITE][PAWN]:
                 if (from_sq >> 3) + 1 == (sq >> 3):
+                    _set_attacked_cache(board.zobrist_key, sq, by_color, True)
                     return True
     else:
         for df in (-1, 1):
             from_sq = sq + 8 - df
             if in_bounds(from_sq) and bit(from_sq) & board.bb[BLACK][PAWN]:
                 if (from_sq >> 3) - 1 == (sq >> 3):
+                    _set_attacked_cache(board.zobrist_key, sq, by_color, True)
                     return True
 
     # Knights
@@ -520,6 +565,7 @@ def is_square_attacked(board: Board, sq, by_color):
         if abs((from_sq & 7) - (sq & 7)) > 2:
             continue
         if bit(from_sq) & board.bb[by_color][KNIGHT]:
+            _set_attacked_cache(board.zobrist_key, sq, by_color, True)
             return True
 
     # Bishops / Queens
@@ -537,6 +583,7 @@ def is_square_attacked(board: Board, sq, by_color):
             to_bb = bit(to)
             if to_bb & all_occ:
                 if to_bb & (board.bb[by_color][BISHOP] | board.bb[by_color][QUEEN]):
+                    _set_attacked_cache(board.zobrist_key, sq, by_color, True)
                     return True
                 break
             to += d
@@ -554,6 +601,7 @@ def is_square_attacked(board: Board, sq, by_color):
             to_bb = bit(to)
             if to_bb & all_occ:
                 if to_bb & (board.bb[by_color][ROOK] | board.bb[by_color][QUEEN]):
+                    _set_attacked_cache(board.zobrist_key, sq, by_color, True)
                     return True
                 break
             to += d
@@ -566,7 +614,9 @@ def is_square_attacked(board: Board, sq, by_color):
         if abs((from_sq & 7) - (sq & 7)) > 1:
             continue
         if bit(from_sq) & board.bb[by_color][KING]:
+            _set_attacked_cache(board.zobrist_key, sq, by_color, True)
             return True
+    _set_attacked_cache(board.zobrist_key, sq, by_color, False)
     return False
 
 
@@ -694,6 +744,10 @@ class Undo:
         "halfmove_clock",
         "fullmove_number",
         "zobrist_key",
+        "eval_mg",
+        "eval_eg",
+        "phase",
+        "pushed_hash",
     )
 
     def __init__(self, move, board: Board):
@@ -703,6 +757,10 @@ class Undo:
         self.halfmove_clock = board.halfmove_clock
         self.fullmove_number = board.fullmove_number
         self.zobrist_key = board.zobrist_key
+        self.eval_mg = board.eval_mg
+        self.eval_eg = board.eval_eg
+        self.phase = board.phase
+        self.pushed_hash = False
 
 
 def make_move(board: Board, move: Move, legal_check_only=False):
@@ -839,6 +897,46 @@ def make_move(board: Board, move: Move, legal_check_only=False):
     board.side_to_move = opp
     board.zobrist_key = key
 
+    # Incremental eval update: only the piece sum (eval_mg, eval_eg, phase)
+    dm_from_mg, dm_from_eg = _piece_eval_contribution(color, piece, move.from_sq)
+    board.eval_mg -= dm_from_mg
+    board.eval_eg -= dm_from_eg
+    board.phase -= _phase_delta(piece)
+    if move.flags & Move.EN_PASSANT:
+        cap_sq = move.to_sq + (-8 if color == WHITE else 8)
+        dc_mg, dc_eg = _piece_eval_contribution(opp, PAWN, cap_sq)
+        board.eval_mg -= dc_mg
+        board.eval_eg -= dc_eg
+        board.phase -= _phase_delta(PAWN)
+    elif captured_piece_type is not None:
+        dc_mg, dc_eg = _piece_eval_contribution(opp, captured_piece_type, move.to_sq)
+        board.eval_mg -= dc_mg
+        board.eval_eg -= dc_eg
+        board.phase -= _phase_delta(captured_piece_type)
+    if move.flags & Move.CASTLE:
+        if color == WHITE:
+            rook_from = fr_to_sq("h", "1") if move.to_sq == fr_to_sq("g", "1") else fr_to_sq("a", "1")
+            rook_to = fr_to_sq("f", "1") if move.to_sq == fr_to_sq("g", "1") else fr_to_sq("d", "1")
+        else:
+            rook_from = fr_to_sq("h", "8") if move.to_sq == fr_to_sq("g", "8") else fr_to_sq("a", "8")
+            rook_to = fr_to_sq("f", "8") if move.to_sq == fr_to_sq("g", "8") else fr_to_sq("d", "8")
+        drf_mg, drf_eg = _piece_eval_contribution(color, ROOK, rook_from)
+        drt_mg, drt_eg = _piece_eval_contribution(color, ROOK, rook_to)
+        board.eval_mg = board.eval_mg - drf_mg + drt_mg
+        board.eval_eg = board.eval_eg - drf_eg + drt_eg
+    if piece == PAWN and move.promo is not None:
+        promo = move.promo
+        dp_mg, dp_eg = _piece_eval_contribution(color, promo, move.to_sq)
+        board.eval_mg += dp_mg
+        board.eval_eg += dp_eg
+        board.phase += _phase_delta(promo)
+    else:
+        dp_mg, dp_eg = _piece_eval_contribution(color, piece, move.to_sq)
+        board.eval_mg += dp_mg
+        board.eval_eg += dp_eg
+        board.phase += _phase_delta(piece)
+    board.phase = max(0, min(24, board.phase))
+
     # Check legality: own king (the side that just moved = `color`) not in check by opponent (`opp`)
     if piece == KING:
         king_sq = move.to_sq
@@ -851,6 +949,9 @@ def make_move(board: Board, move: Move, legal_check_only=False):
 
     if not legal_check_only:
         board.hash_history.append(board.zobrist_key)
+        k = board.zobrist_key
+        board.hash_count[k] = board.hash_count.get(k, 0) + 1
+        board.history[-1].pushed_hash = True
     return True
 
 
@@ -866,8 +967,14 @@ def undo_move(board: Board):
     board.halfmove_clock = undo.halfmove_clock
     board.fullmove_number = undo.fullmove_number
     board.zobrist_key = undo.zobrist_key
-    if board.hash_history:
-        board.hash_history.pop()
+    board.eval_mg = undo.eval_mg
+    board.eval_eg = undo.eval_eg
+    board.phase = undo.phase
+    if undo.pushed_hash and board.hash_history:
+        k = board.hash_history.pop()
+        board.hash_count[k] = board.hash_count.get(k, 1) - 1
+        if board.hash_count[k] <= 0:
+            del board.hash_count[k]
 
     from_bb = bit(move.from_sq)
     to_bb = bit(move.to_sq)
@@ -1004,14 +1111,37 @@ EG_KING_PST = [
 PIECE_VALUES_MG = [100, 320, 330, 500, 900, 0]
 PIECE_VALUES_EG = [120, 300, 320, 500, 900, 0]
 
+# Phase weights for incremental update (KNIGHT, BISHOP, ROOK, QUEEN)
+PHASE_WEIGHTS = (1, 1, 2, 4)
+
+
+def _piece_eval_contribution(color, piece, sq):
+    """Return (mg, eg) contribution of one piece on sq. Used for incremental eval."""
+    sign = 1 if color == WHITE else -1
+    mirror_sq = sq ^ 56 if color == BLACK else sq
+    if piece == KING:
+        mg = sign * (PIECE_VALUES_MG[KING] + MG_PST[KING][mirror_sq])
+        eg = sign * (PIECE_VALUES_EG[KING] + EG_KING_PST[mirror_sq])
+    else:
+        mg = sign * (PIECE_VALUES_MG[piece] + MG_PST[piece][mirror_sq])
+        eg = sign * (PIECE_VALUES_EG[piece] + MG_PST[piece][mirror_sq])
+    return mg, eg
+
+
+def _phase_delta(piece):
+    """Return phase weight for piece (0 for PAWN/KING)."""
+    if piece in (PAWN, KING):
+        return 0
+    return PHASE_WEIGHTS[piece - 2]  # KNIGHT=0, BISHOP=1, ROOK=2, QUEEN=3
+
 
 def game_phase(board: Board):
     # simple: sum piece values excluding pawns and kings
     phase = 0
     for c in (WHITE, BLACK):
         for p, w in zip(
-            (KNIGHT, BISHOP, ROOK, QUEEN),
-            (1, 1, 2, 4),
+                (KNIGHT, BISHOP, ROOK, QUEEN),
+                (1, 1, 2, 4),
         ):
             phase += popcount(board.bb[c][p]) * w
     return max(0, min(24, phase))
@@ -1053,8 +1183,10 @@ def bad_capture_ordering_penalty(board: Board, to_sq, our_piece_value, opp_color
 
 def eval_board(board: Board):
     # positive is good for side to move (we return from POV of side_to_move later)
-    mg = 0
-    eg = 0
+    # Use incremental piece sum (eval_mg, eval_eg, phase); rest computed here
+    score = board.eval_mg
+    eg = board.eval_eg
+    phase = board.phase
     bishop_count = [0, 0]
     passed_pawns = [0, 0]
 
@@ -1063,18 +1195,10 @@ def eval_board(board: Board):
         files_bb[sq & 7] |= bit(sq)
 
     for color in (WHITE, BLACK):
-        sign = 1 if color == WHITE else -1
         for p in range(6):
             bb = board.bb[color][p]
             while bb:
                 sq, bb = pop_lsb(bb)
-                mirror_sq = sq ^ 56 if color == BLACK else sq
-                if p == KING:
-                    mg += sign * (PIECE_VALUES_MG[p] + MG_PST[KING][mirror_sq])
-                    eg += sign * (PIECE_VALUES_EG[p] + EG_KING_PST[mirror_sq])
-                else:
-                    mg += sign * (PIECE_VALUES_MG[p] + MG_PST[p][mirror_sq])
-                    eg += sign * (PIECE_VALUES_EG[p] + MG_PST[p][mirror_sq])
                 if p == BISHOP:
                     bishop_count[color] += 1
                 if p == PAWN:
@@ -1103,7 +1227,6 @@ def eval_board(board: Board):
                         passed_pawns[color] += 1
 
     # bishop pair
-    score = mg
     if bishop_count[WHITE] >= 2:
         score += 30
     if bishop_count[BLACK] >= 2:
@@ -1113,7 +1236,6 @@ def eval_board(board: Board):
     score += 20 * passed_pawns[WHITE]
     score -= 20 * passed_pawns[BLACK]
 
-    phase = game_phase(board)
     mg_weight = phase
     eg_weight = 24 - phase
 
@@ -1227,7 +1349,8 @@ class Searcher:
     def store_tt(self, key, depth, score, flag, move):
         idx = key & (self.tt_size - 1)
         entry = self.tt[idx]
-        if entry.key != key or depth >= entry.depth:
+        # Prefer replacing stale entries (from previous search) or lower-depth entries
+        if entry.key != key or depth >= entry.depth or entry.age != self.age:
             self.tt[idx] = TTEntry(key, depth, score, flag, move, self.age)
 
     def time_up(self):
@@ -1284,10 +1407,10 @@ class Searcher:
         if not legal_root_moves:
             self.best_move = None
         elif self.best_move is None or not any(
-            m.from_sq == self.best_move.from_sq
-            and m.to_sq == self.best_move.to_sq
-            and m.promo == self.best_move.promo
-            for m in legal_root_moves
+                m.from_sq == self.best_move.from_sq
+                and m.to_sq == self.best_move.to_sq
+                and m.promo == self.best_move.promo
+                for m in legal_root_moves
         ):
             # Fall back to the first legal move.
             self.best_move = legal_root_moves[0]
@@ -1311,13 +1434,18 @@ class Searcher:
             return []
         return [self.best_move]
 
-    def negamax(self, board: Board, depth, alpha, beta, ply, root=False, allow_null=True):
+    def negamax(self, board: Board, depth, alpha, beta, ply, root=False, allow_null=True, extended=False):
         if self.time_up():
             return 0
         self.nodes += 1
 
-        # repetition and fifty-move
-        if board.halfmove_clock >= 100 or board.hash_history.count(board.zobrist_key) >= 3:
+        # Check extension: one extra ply when in check, only at depth 1..4 and at most once in a row
+        do_extend = in_check(board) and 1 <= depth <= 4 and not extended
+        next_depth = depth if do_extend else (depth - 1)
+        next_extended = extended or do_extend
+
+        # repetition and fifty-move (O(1) via hash_count)
+        if board.halfmove_clock >= 100 or board.hash_count.get(board.zobrist_key, 0) >= 3:
             # anti-threefold in winning positions: if eval > threshold, avoid draw
             stand_pat = eval_board(board)
             if stand_pat > 80 and not root:
@@ -1328,6 +1456,7 @@ class Searcher:
 
         if depth <= 0:
             return self.quiescence(board, alpha, beta, ply)
+        # next_depth / next_extended set above (check extension)
 
         key = board.zobrist_key
         tt_entry = self.probe_tt(key)
@@ -1365,16 +1494,16 @@ class Searcher:
             matched = False
             for m in legal_moves:
                 if (
-                    m.from_sq == tt_move.from_sq
-                    and m.to_sq == tt_move.to_sq
-                    and m.promo == tt_move.promo
+                        m.from_sq == tt_move.from_sq
+                        and m.to_sq == tt_move.to_sq
+                        and m.promo == tt_move.promo
                 ):
                     matched = True
                     break
             if not matched:
                 tt_move = None
 
-        phase = game_phase(board)
+        phase = board.phase
         order_board = getattr(self, "order_board", None)
 
         def move_score(m):
@@ -1389,7 +1518,8 @@ class Searcher:
                         if bit(m.from_sq) & board.bb[board.side_to_move][pt]:
                             attacker = pt
                             break
-                score += 1000 * (PIECE_VALUES_MG[victim] - (PIECE_VALUES_MG[attacker] if attacker is not None else 0) // 10)
+                score += 1000 * (
+                            PIECE_VALUES_MG[victim] - (PIECE_VALUES_MG[attacker] if attacker is not None else 0) // 10)
             else:
                 score += self.history_heur[(board.side_to_move, m.from_sq, m.to_sq)]
             # Move filtering (ordering): avoid moves that leave pieces en prise when alternatives exist.
@@ -1431,14 +1561,14 @@ class Searcher:
         # Disabled: in check, depth < 3, zugzwang-prone, or consecutive null (allow_null=False).
         NULL_R = 3
         if (
-            depth >= 3
-            and allow_null
-            and not in_check(board)
-            and not is_zugzwang_prone(board)
+                depth >= 3
+                and allow_null
+                and not in_check(board)
+                and not is_zugzwang_prone(board)
         ):
             saved = make_null_move(board)
             null_score = -self.negamax(
-                board, depth - 1 - NULL_R, -beta, -beta + 1, ply + 1, root=False, allow_null=False
+                board, depth - 1 - NULL_R, -beta, -beta + 1, ply + 1, root=False, allow_null=False, extended=next_extended
             )
             undo_null_move(board, saved)
             if self.time_up():
@@ -1446,31 +1576,39 @@ class Searcher:
             if null_score >= beta:
                 return beta
 
-        LMR_FULL_MOVES = 4   # Don't reduce first N moves (late moves only)
-        LMR_REDUCTION = 2    # Reduce depth by this for LMR try
+        LMR_FULL_MOVES = 4  # Don't reduce first N moves (late moves only)
+        LMR_REDUCTION = 2  # Reduce depth by this for LMR try
 
         for i, m in enumerate(legal_moves):
             if not make_move(board, m):
                 continue
-            # Late Move Reduction: only for late quiet non-checking moves at sufficient depth.
+            # Late Move Reduction: don't reduce checks or pawn pushes to 6th/7th rank
+            gives_check = in_check(board)
+            to_rank = m.to_sq >> 3
+            moved_color = 1 - board.side_to_move
+            pawn_push_78 = (
+                    m.piece == PAWN and not m.is_capture()
+                    and ((moved_color == WHITE and to_rank in (5, 6)) or (moved_color == BLACK and to_rank in (1, 2)))
+            )
             do_lmr = (
-                depth >= 3
-                and i >= LMR_FULL_MOVES
-                and m.is_quiet()
-                and not in_check(board)   # do not reduce checking moves
+                    depth >= 3
+                    and i >= LMR_FULL_MOVES
+                    and m.is_quiet()
+                    and not gives_check
+                    and not pawn_push_78
             )
             if do_lmr:
                 score = -self.negamax(
-                    board, depth - 1 - LMR_REDUCTION, -beta, -alpha, ply + 1, root=False, allow_null=True
+                    board, next_depth - LMR_REDUCTION, -beta, -alpha, ply + 1, root=False, allow_null=True, extended=next_extended
                 )
                 if score > alpha:
                     # Re-search at full depth if reduced search improved alpha
                     score = -self.negamax(
-                        board, depth - 1, -beta, -alpha, ply + 1, root=False, allow_null=True
+                        board, next_depth, -beta, -alpha, ply + 1, root=False, allow_null=True, extended=next_extended
                     )
             else:
                 score = -self.negamax(
-                    board, depth - 1, -beta, -alpha, ply + 1, root=False, allow_null=True
+                    board, next_depth, -beta, -alpha, ply + 1, root=False, allow_null=True, extended=next_extended
                 )
             undo_move(board)
             if self.time_up():
@@ -1579,7 +1717,7 @@ class UCI:
             set_fen(self.board, START_FEN)
             idx += 1
         elif parts[idx] == "fen":
-            fen = " ".join(parts[idx + 1 : idx + 7])
+            fen = " ".join(parts[idx + 1: idx + 7])
             set_fen(self.board, fen)
             idx += 7
         if idx < len(parts) and parts[idx] == "moves":
@@ -1653,4 +1791,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
