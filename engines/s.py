@@ -25,7 +25,9 @@ Features:
 - EG PST for all pieces; passed/doubled/weak pawn bonuses; rook open/semi-open file; piece-in-center bonuses
 - King safety: pawn shield, attack weight; TT replacement prefers EXACT/same depth
 - Move ordering: killer moves, counter-move heuristic; extensions: check, pawn to 7th; dynamic LMR
-- Quiescence: captures + promotions + quiet checks; Syzygy placeholder for future TB integration
+- Quiescence: captures + promotions + quiet checks; depth limit (QSEARCH_MAX_PLY) to avoid check cycles
+- PVS (null-window for non-PV), soft futility at depth 1 only, strict LMR (first 2 moves full depth)
+- Eval: rook on 7th, knight outpost; passed-pawn rank bonus scales up in endgame; all new bonuses capped
 
 This is designed to be reasonably strong but concise, not a top-tier engine.
 
@@ -67,6 +69,13 @@ Why correct sacrifices are not suppressed:
 WHITE, BLACK = 0, 1
 
 PAWN, KNIGHT, BISHOP, ROOK, QUEEN, KING = range(6)
+
+# --- Feature flags: set False to disable (safe fallback, no regression) ---
+USE_PVS = True           # Principal Variation Search: null-window for non-PV moves, re-search on fail-high
+USE_FUTILITY = True      # Soft futility pruning at depth 1 only (quiet, no check, margin ~120 cp)
+USE_LMR_STRICT = True    # LMR: only quiet, depth>=3, skip first 2 moves, no check/promo, max reduction 2
+QSEARCH_MAX_PLY = 8      # Max quiescence depth (promo/checks) to avoid check cycles; 0 = no limit on checks
+COUNTER_BONUS = 400_000  # Counter-move ordering bonus (weak; must stay below TT/captures)
 
 PIECE_SYMBOLS = {
     (WHITE, PAWN): "P",
@@ -1186,6 +1195,9 @@ for _f in range(8):
 # Center squares (d4,d5,e4,e5) for piece interaction bonuses
 CENTER_SQS = {sq_index(3, 3), sq_index(3, 4), sq_index(4, 3), sq_index(4, 4)}
 
+# Max positional bonus (cp) for new terms; scale by phase
+EVAL_BONUS_CAP = 50
+
 PIECE_VALUES_MG = [100, 320, 330, 500, 900, 0]
 PIECE_VALUES_EG = [120, 300, 320, 500, 900, 0]
 
@@ -1272,8 +1284,10 @@ def eval_board(board: Board):
     weak_pawns = [0, 0]
     rook_open_bonus = [0, 0]
     rook_semi_open_bonus = [0, 0]
+    rook_7th_bonus = [0, 0]
     knight_center_bonus = [0, 0]
     bishop_center_bonus = [0, 0]
+    knight_outpost_bonus = [0, 0]
 
     for color in (WHITE, BLACK):
         for p in range(6):
@@ -1284,16 +1298,36 @@ def eval_board(board: Board):
                     bishop_count[color] += 1
                     if sq in CENTER_SQS:
                         bishop_center_bonus[color] += 12
-                if p == KNIGHT and sq in CENTER_SQS:
-                    knight_center_bonus[color] += 15
+                if p == KNIGHT:
+                    if sq in CENTER_SQS:
+                        knight_center_bonus[color] += 15
+                    # Outpost: knight cannot be driven by enemy pawn (no enemy pawn can attack this sq)
+                    f, r = sq & 7, sq >> 3
+                    if color == WHITE:
+                        if r >= 2 and f >= 1 and f <= 6:
+                            attack_sq1 = sq_index(f - 1, r + 1) if r + 1 <= 7 else -1
+                            attack_sq2 = sq_index(f + 1, r + 1) if r + 1 <= 7 else -1
+                            if (attack_sq1 < 0 or not (bit(attack_sq1) & board.bb[BLACK][PAWN])) and (
+                                    attack_sq2 < 0 or not (bit(attack_sq2) & board.bb[BLACK][PAWN])):
+                                knight_outpost_bonus[color] += 12
+                    else:
+                        if r <= 5 and f >= 1 and f <= 6:
+                            attack_sq1 = sq_index(f - 1, r - 1) if r - 1 >= 0 else -1
+                            attack_sq2 = sq_index(f + 1, r - 1) if r - 1 >= 0 else -1
+                            if (attack_sq1 < 0 or not (bit(attack_sq1) & board.bb[WHITE][PAWN])) and (
+                                    attack_sq2 < 0 or not (bit(attack_sq2) & board.bb[WHITE][PAWN])):
+                                knight_outpost_bonus[color] += 12
                 if p == ROOK:
                     f = sq & 7
+                    r = sq >> 3
                     if is_open_file(board, f):
                         rook_open_bonus[color] += 18
                     else:
                         our_pawns_on_f = FILE_BB[f] & board.bb[color][PAWN]
                         if not our_pawns_on_f:
                             rook_semi_open_bonus[color] += 10
+                    if (color == WHITE and r == 6) or (color == BLACK and r == 1):
+                        rook_7th_bonus[color] += min(EVAL_BONUS_CAP, 15)
                 if p == PAWN:
                     f = sq & 7
                     pawn_rank = sq >> 3
@@ -1329,17 +1363,20 @@ def eval_board(board: Board):
     if bishop_count[BLACK] >= 2:
         score -= bishop_pair_bonus
 
-    # Passed pawns: base + rank-based bonus (closer to promotion = more)
-    score += 20 * passed_pawns[WHITE] + passed_rank_bonus[WHITE]
-    score -= 20 * passed_pawns[BLACK] + passed_rank_bonus[BLACK]
+    # Passed pawns: base + rank-based (closer = more); rank bonus slightly stronger in endgame (no sharp jump)
+    passed_scale = 24 + (24 - phase)
+    score += 20 * passed_pawns[WHITE] + (passed_rank_bonus[WHITE] * passed_scale // 24)
+    score -= 20 * passed_pawns[BLACK] + (passed_rank_bonus[BLACK] * passed_scale // 24)
     score -= 15 * doubled_pawns[WHITE]
     score += 15 * doubled_pawns[BLACK]
     score -= 12 * weak_pawns[WHITE]
     score += 12 * weak_pawns[BLACK]
 
-    # Piece interaction: rooks on open/semi-open files, pieces in center
-    score += rook_open_bonus[WHITE] + rook_semi_open_bonus[WHITE] + knight_center_bonus[WHITE] + bishop_center_bonus[WHITE]
-    score -= rook_open_bonus[BLACK] + rook_semi_open_bonus[BLACK] + knight_center_bonus[BLACK] + bishop_center_bonus[BLACK]
+    # Piece interaction: rooks open/semi-open/7th, center, knight outpost (new terms capped at EVAL_BONUS_CAP)
+    score += (rook_open_bonus[WHITE] + rook_semi_open_bonus[WHITE] + min(EVAL_BONUS_CAP, rook_7th_bonus[WHITE]) +
+              knight_center_bonus[WHITE] + bishop_center_bonus[WHITE] + min(EVAL_BONUS_CAP, knight_outpost_bonus[WHITE]))
+    score -= (rook_open_bonus[BLACK] + rook_semi_open_bonus[BLACK] + min(EVAL_BONUS_CAP, rook_7th_bonus[BLACK]) +
+              knight_center_bonus[BLACK] + bishop_center_bonus[BLACK] + min(EVAL_BONUS_CAP, knight_outpost_bonus[BLACK]))
 
     mg_weight = phase
     eg_weight = 24 - phase
@@ -1657,11 +1694,12 @@ class Searcher:
             score = 0
             if tt_move and m.from_sq == tt_move.from_sq and m.to_sq == tt_move.to_sq and m.promo == tt_move.promo:
                 score += 10_000_000
-            if prev_move is not None:
+            # Counter-move: weak bonus only, must not override TT or MVV-LVA
+            if prev_move is not None and COUNTER_BONUS:
                 key = (1 - stm, prev_move.from_sq, prev_move.to_sq, prev_move.promo)
                 c = self.counter_move.get(key)
                 if c and c[0] == m.from_sq and c[1] == m.to_sq and c[2] == m.promo:
-                    score += 3_000_000
+                    score += COUNTER_BONUS
             if m.is_quiet():
                 k1 = self.killer1.get(ply)
                 if k1 and k1[0] == m.from_sq and k1[1] == m.to_sq and k1[2] == m.promo:
@@ -1736,7 +1774,11 @@ class Searcher:
             if null_score >= beta:
                 return beta
 
-        LMR_FULL_MOVES = 4  # Don't reduce first N moves (late moves only)
+        # LMR: only quiet, depth>=3, not first 2 moves, not check/promo; max reduction 2 (disableable)
+        LMR_FULL_MOVES = 2 if USE_LMR_STRICT else 4
+
+        # Soft futility at depth 1 only: skip quiet non-check non-promo if child stand_pat suggests score won't beat alpha
+        FUTILITY_MARGIN = 120
 
         for i, m in enumerate(legal_moves):
             if not make_move(board, m):
@@ -1755,16 +1797,25 @@ class Searcher:
             effective_depth = next_depth
             if pawn_to_7th and depth <= 4 and not next_extended:
                 effective_depth = depth
+
+            # Futility: only depth 1, quiet, no promo, no check; skip if child eval suggests we won't beat alpha
+            if USE_FUTILITY and depth == 1 and m.is_quiet() and m.promo is None and not gives_check:
+                child_stand_pat = eval_board(board)
+                if child_stand_pat < -alpha - FUTILITY_MARGIN:
+                    undo_move(board)
+                    continue
+
             do_lmr = (
                     depth >= 3
                     and i >= LMR_FULL_MOVES
                     and m.is_quiet()
                     and not gives_check
                     and not pawn_push_78
+                    and m.promo is None
             )
             if do_lmr:
                 hist = self.history_heur.get((stm, m.from_sq, m.to_sq), 0)
-                lmr_reduction = 1 if hist > 8000 else 2
+                lmr_reduction = min(2, 1 if hist > 8000 else 2)
                 score = -self.negamax(
                     board, effective_depth - lmr_reduction, -beta, -alpha, ply + 1, root=False, allow_null=True, extended=next_extended, prev_move=m
                 )
@@ -1773,9 +1824,19 @@ class Searcher:
                         board, effective_depth, -beta, -alpha, ply + 1, root=False, allow_null=True, extended=next_extended, prev_move=m
                     )
             else:
-                score = -self.negamax(
-                    board, effective_depth, -beta, -alpha, ply + 1, root=False, allow_null=True, extended=next_extended, prev_move=m
-                )
+                # PVS: when depth>=2, first move full window, rest null-window; re-search on fail-high
+                if USE_PVS and depth >= 2 and i > 0:
+                    score = -self.negamax(
+                        board, effective_depth, -alpha - 1, -alpha, ply + 1, root=False, allow_null=True, extended=next_extended, prev_move=m
+                    )
+                    if score > alpha and score < beta:
+                        score = -self.negamax(
+                            board, effective_depth, -beta, -alpha, ply + 1, root=False, allow_null=True, extended=next_extended, prev_move=m
+                        )
+                else:
+                    score = -self.negamax(
+                        board, effective_depth, -beta, -alpha, ply + 1, root=False, allow_null=True, extended=next_extended, prev_move=m
+                    )
             undo_move(board)
             if self.time_up():
                 return 0
@@ -1818,7 +1879,8 @@ class Searcher:
             self.best_move = best_move
         return best_score
 
-    def quiescence(self, board: Board, alpha, beta, ply):
+    def quiescence(self, board: Board, alpha, beta, ply, qply=0):
+        """Qsearch: captures, then (if qply < limit) promotions and checking moves. Depth limit avoids check cycles."""
         if self.time_up():
             return 0
         self.nodes += 1
@@ -1834,7 +1896,7 @@ class Searcher:
                 continue
             if not make_move(board, m):
                 continue
-            score = -self.quiescence(board, -beta, -alpha, ply + 1)
+            score = -self.quiescence(board, -beta, -alpha, ply + 1, qply + 1)
             undo_move(board)
             if self.time_up():
                 return 0
@@ -1842,6 +1904,10 @@ class Searcher:
                 return beta
             if score > alpha:
                 alpha = score
+
+        # Promotions and quiet checks only within depth limit (no aggressive pruning)
+        if QSEARCH_MAX_PLY and qply >= QSEARCH_MAX_PLY:
+            return alpha
 
         all_moves = gen_moves(board, captures_only=False)
         for m in all_moves:
@@ -1856,7 +1922,7 @@ class Searcher:
                 continue
             if not make_move(board, m):
                 continue
-            score = -self.quiescence(board, -beta, -alpha, ply + 1)
+            score = -self.quiescence(board, -beta, -alpha, ply + 1, qply + 1)
             undo_move(board)
             if self.time_up():
                 return 0
