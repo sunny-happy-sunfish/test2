@@ -72,7 +72,7 @@ PAWN, KNIGHT, BISHOP, ROOK, QUEEN, KING = range(6)
 
 # --- Feature flags: set False to disable (safe fallback, no regression) ---
 USE_PVS = True           # Principal Variation Search: null-window for non-PV moves, re-search on fail-high
-USE_FUTILITY = True      # Soft futility pruning at depth 1 only (quiet, no check, margin ~120 cp)
+USE_FUTILITY = True      # Soft futility at depth 1 only; only when not in check and eval >= -150; margin 80 cp
 USE_LMR_STRICT = True    # LMR: only quiet, depth>=3, skip first 2 moves, no check/promo, max reduction 2
 QSEARCH_MAX_PLY = 8      # Max quiescence depth (promo/checks) to avoid check cycles; 0 = no limit on checks
 COUNTER_BONUS = 400_000  # Counter-move ordering bonus (weak; must stay below TT/captures)
@@ -1413,6 +1413,12 @@ def eval_board(board: Board):
             score -= sign * 22
         if 2 <= kf <= 5 and 2 <= kr <= 5:
             score -= sign * 12
+        # Micro-patch: extra penalty if king in center AND (queens on board OR open file near king); middlegame only
+        if phase > 8 and 2 <= kf <= 5 and 2 <= kr <= 5:
+            queens_out = bool(board.bb[WHITE][QUEEN] or board.bb[BLACK][QUEEN])
+            open_near = is_open_file(board, kf) or (kf > 0 and is_open_file(board, kf - 1)) or (kf < 7 and is_open_file(board, kf + 1))
+            if queens_out or open_near:
+                score -= sign * min(EVAL_BONUS_CAP, 12)
         # Pawn shield: bonus for pawns on 2-3 squares in front of king (MG)
         shield_rank = kr + 1 if color == WHITE else kr - 1
         if 0 <= shield_rank <= 7:
@@ -1777,10 +1783,21 @@ class Searcher:
         # LMR: only quiet, depth>=3, not first 2 moves, not check/promo; max reduction 2 (disableable)
         LMR_FULL_MOVES = 2 if USE_LMR_STRICT else 4
 
-        # Soft futility at depth 1 only: skip quiet non-check non-promo if child stand_pat suggests score won't beat alpha
-        FUTILITY_MARGIN = 120
+        # Precompute for futility and LMR (no extra eval when not needed)
+        in_check_before = in_check(board)
+        current_eval_for_futility = eval_board(board) if (USE_FUTILITY and depth == 1) else None
+        current_eval_for_lmr = eval_board(board) if (USE_LMR_STRICT and depth >= 3) else None
+
+        # Soft futility: only depth 1, not in check, eval >= -150; margin 80 cp (defensive positions: don't prune)
+        FUTILITY_MARGIN = 80
 
         for i, m in enumerate(legal_moves):
+            # Defensive move detection for LMR (before make_move; board is current node)
+            was_attacked = (
+                    USE_LMR_STRICT
+                    and depth >= 3
+                    and min_attacker_value(board, m.from_sq, 1 - stm) < 10_000_000
+            )
             if not make_move(board, m):
                 continue
             gives_check = in_check(board)
@@ -1798,13 +1815,32 @@ class Searcher:
             if pawn_to_7th and depth <= 4 and not next_extended:
                 effective_depth = depth
 
-            # Futility: only depth 1, quiet, no promo, no check; skip if child eval suggests we won't beat alpha
-            if USE_FUTILITY and depth == 1 and m.is_quiet() and m.promo is None and not gives_check:
+            # Futility: only when not in check, eval >= -150; in bad/defensive positions do not prune
+            if (
+                    USE_FUTILITY
+                    and depth == 1
+                    and not in_check_before
+                    and current_eval_for_futility is not None
+                    and current_eval_for_futility >= -150
+                    and m.is_quiet()
+                    and m.promo is None
+                    and not gives_check
+            ):
                 child_stand_pat = eval_board(board)
                 if child_stand_pat < -alpha - FUTILITY_MARGIN:
                     undo_move(board)
                     continue
 
+            # LMR: forbid reduction on defensive moves (eval < -100, in check, king move, or moving attacked piece)
+            no_lmr_defensive = (
+                    USE_LMR_STRICT
+                    and (
+                            (current_eval_for_lmr is not None and current_eval_for_lmr < -100)
+                            or in_check_before
+                            or (m.piece == KING)
+                            or was_attacked
+                    )
+            )
             do_lmr = (
                     depth >= 3
                     and i >= LMR_FULL_MOVES
@@ -1812,6 +1848,7 @@ class Searcher:
                     and not gives_check
                     and not pawn_push_78
                     and m.promo is None
+                    and not no_lmr_defensive
             )
             if do_lmr:
                 hist = self.history_heur.get((stm, m.from_sq, m.to_sq), 0)
