@@ -22,6 +22,10 @@ Features:
 - Anti-threefold repetition in clearly winning positions
 - UCI protocol with info (depth, nodes, nps, score cp/mate)
 - Blunder avoidance and king-safety heuristics (see below)
+- EG PST for all pieces; passed/doubled/weak pawn bonuses; rook open/semi-open file; piece-in-center bonuses
+- King safety: pawn shield, attack weight; TT replacement prefers EXACT/same depth
+- Move ordering: killer moves, counter-move heuristic; extensions: check, pawn to 7th; dynamic LMR
+- Quiescence: captures + promotions + quiet checks; Syzygy placeholder for future TB integration
 
 This is designed to be reasonably strong but concise, not a top-tier engine.
 
@@ -191,10 +195,12 @@ ZOBRIST_PIECE = [[[0] * 64 for _ in range(6)] for _ in range(2)]
 ZOBRIST_CASTLING = [0] * 16
 ZOBRIST_EP = [0] * 64
 ZOBRIST_SIDE = 0
+# Precomputed Zobrist XOR for entire castle move (king + rook pieces only; castling rights done separately)
+ZOBRIST_CASTLE_PIECE = [[0, 0], [0, 0]]  # [color][0=kingside, 1=queenside]
 
 
 def init_zobrist():
-    global ZOBRIST_SIDE
+    global ZOBRIST_SIDE, ZOBRIST_CASTLE_PIECE
     rnd = random.Random(20250101)
     for c in (WHITE, BLACK):
         for p in range(6):
@@ -205,6 +211,19 @@ def init_zobrist():
     for sq in range(64):
         ZOBRIST_EP[sq] = rnd.getrandbits(64)
     ZOBRIST_SIDE = rnd.getrandbits(64)
+    # Precompute one XOR value per castle type (piece moves only)
+    e1, g1, h1, f1 = fr_to_sq("e", "1"), fr_to_sq("g", "1"), fr_to_sq("h", "1"), fr_to_sq("f", "1")
+    e8, g8, h8, f8 = fr_to_sq("e", "8"), fr_to_sq("g", "8"), fr_to_sq("h", "8"), fr_to_sq("f", "8")
+    c1, a1, d1 = fr_to_sq("c", "1"), fr_to_sq("a", "1"), fr_to_sq("d", "1")
+    c8, a8, d8 = fr_to_sq("c", "8"), fr_to_sq("a", "8"), fr_to_sq("d", "8")
+    ZOBRIST_CASTLE_PIECE[WHITE][0] = (ZOBRIST_PIECE[WHITE][KING][e1] ^ ZOBRIST_PIECE[WHITE][KING][g1] ^
+                                      ZOBRIST_PIECE[WHITE][ROOK][h1] ^ ZOBRIST_PIECE[WHITE][ROOK][f1])
+    ZOBRIST_CASTLE_PIECE[WHITE][1] = (ZOBRIST_PIECE[WHITE][KING][e1] ^ ZOBRIST_PIECE[WHITE][KING][c1] ^
+                                      ZOBRIST_PIECE[WHITE][ROOK][a1] ^ ZOBRIST_PIECE[WHITE][ROOK][d1])
+    ZOBRIST_CASTLE_PIECE[BLACK][0] = (ZOBRIST_PIECE[BLACK][KING][e8] ^ ZOBRIST_PIECE[BLACK][KING][g8] ^
+                                      ZOBRIST_PIECE[BLACK][ROOK][h8] ^ ZOBRIST_PIECE[BLACK][ROOK][f8])
+    ZOBRIST_CASTLE_PIECE[BLACK][1] = (ZOBRIST_PIECE[BLACK][KING][e8] ^ ZOBRIST_PIECE[BLACK][KING][c8] ^
+                                      ZOBRIST_PIECE[BLACK][ROOK][a8] ^ ZOBRIST_PIECE[BLACK][ROOK][d8])
 
 
 def compute_hash(board: Board):
@@ -692,11 +711,8 @@ def get_attackers(board: Board, sq, by_color):
 
 
 def is_open_file(board: Board, file):
-    """True if there are no pawns on the given file (0..7)."""
-    mask = 0
-    for r in range(8):
-        mask |= bit(sq_index(file, r))
-    return not (mask & (board.bb[WHITE][PAWN] | board.bb[BLACK][PAWN]))
+    """True if there are no pawns on the given file (0..7). Uses cached FILE_BB."""
+    return not (FILE_BB[file] & (board.bb[WHITE][PAWN] | board.bb[BLACK][PAWN]))
 
 
 def is_zugzwang_prone(board: Board):
@@ -793,11 +809,13 @@ def make_move(board: Board, move: Move, legal_check_only=False):
                 break
         move.piece = piece
 
-    # Remove moving piece from from_sq
+    # Remove moving piece from from_sq (for castle, key update done in castle block)
     board.bb[color][piece] ^= from_bb
     board.occ[color] ^= from_bb
     board.all_occ ^= from_bb
-    key ^= ZOBRIST_PIECE[color][piece][move.from_sq]
+    is_castle = bool(move.flags & Move.CASTLE)
+    if not is_castle:
+        key ^= ZOBRIST_PIECE[color][piece][move.from_sq]
 
     captured_piece_type = move.capture
 
@@ -839,43 +857,40 @@ def make_move(board: Board, move: Move, legal_check_only=False):
         key ^= ZOBRIST_CASTLING[old_castling]
         key ^= ZOBRIST_CASTLING[board.castling]
 
-    # Castling move rook
+    # Castling move rook (Zobrist: one precomputed XOR for king+rook)
     if move.flags & Move.CASTLE:
         if color == WHITE:
             if move.to_sq == fr_to_sq("g", "1"):
-                # king side
-                rook_from = fr_to_sq("h", "1")
-                rook_to = fr_to_sq("f", "1")
+                rook_from, rook_to = fr_to_sq("h", "1"), fr_to_sq("f", "1")
+                key ^= ZOBRIST_CASTLE_PIECE[WHITE][0]
             else:
-                rook_from = fr_to_sq("a", "1")
-                rook_to = fr_to_sq("d", "1")
+                rook_from, rook_to = fr_to_sq("a", "1"), fr_to_sq("d", "1")
+                key ^= ZOBRIST_CASTLE_PIECE[WHITE][1]
         else:
             if move.to_sq == fr_to_sq("g", "8"):
-                rook_from = fr_to_sq("h", "8")
-                rook_to = fr_to_sq("f", "8")
+                rook_from, rook_to = fr_to_sq("h", "8"), fr_to_sq("f", "8")
+                key ^= ZOBRIST_CASTLE_PIECE[BLACK][0]
             else:
-                rook_from = fr_to_sq("a", "8")
-                rook_to = fr_to_sq("d", "8")
+                rook_from, rook_to = fr_to_sq("a", "8"), fr_to_sq("d", "8")
+                key ^= ZOBRIST_CASTLE_PIECE[BLACK][1]
         rf_bb = bit(rook_from)
         rt_bb = bit(rook_to)
         board.bb[color][ROOK] ^= rf_bb
         board.occ[color] ^= rf_bb
         board.all_occ ^= rf_bb
-        key ^= ZOBRIST_PIECE[color][ROOK][rook_from]
-
         board.bb[color][ROOK] ^= rt_bb
         board.occ[color] ^= rt_bb
         board.all_occ ^= rt_bb
-        key ^= ZOBRIST_PIECE[color][ROOK][rook_to]
 
-    # Promotion
+    # Promotion (for castle, king already accounted in ZOBRIST_CASTLE_PIECE)
     if piece == PAWN and move.promo is not None:
         promo = move.promo
         board.bb[color][promo] ^= to_bb
         key ^= ZOBRIST_PIECE[color][promo][move.to_sq]
     else:
         board.bb[color][piece] ^= to_bb
-        key ^= ZOBRIST_PIECE[color][piece][move.to_sq]
+        if not is_castle:
+            key ^= ZOBRIST_PIECE[color][piece][move.to_sq]
     board.occ[color] ^= to_bb
     board.all_occ ^= to_bb
 
@@ -1108,6 +1123,69 @@ EG_KING_PST = [
     -50, -30, -30, -30, -30, -30, -30, -50,
 ]
 
+# Endgame PST for all pieces (king uses EG_KING_PST). Improves eval in endgame.
+EG_PST = {
+    PAWN: [
+        0, 0, 0, 0, 0, 0, 0, 0,
+        3, 6, 6, 6, 6, 6, 6, 3,
+        4, 8, 12, 14, 14, 12, 8, 4,
+        6, 12, 18, 22, 22, 18, 12, 6,
+        10, 18, 26, 32, 32, 26, 18, 10,
+        18, 28, 38, 44, 44, 38, 28, 18,
+        0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0,
+    ],
+    KNIGHT: [
+        -50, -40, -30, -30, -30, -30, -40, -50,
+        -40, -20, 0, 0, 0, 0, -20, -40,
+        -30, 0, 10, 15, 15, 10, 0, -30,
+        -30, 5, 15, 20, 20, 15, 5, -30,
+        -30, 0, 15, 20, 20, 15, 0, -30,
+        -30, 5, 10, 15, 15, 10, 5, -30,
+        -40, -20, 0, 5, 5, 0, -20, -40,
+        -50, -40, -30, -30, -30, -30, -40, -50,
+    ],
+    BISHOP: [
+        -20, -10, -10, -10, -10, -10, -10, -20,
+        -10, 5, 0, 0, 0, 0, 5, -10,
+        -10, 10, 10, 10, 10, 10, 10, -10,
+        -10, 0, 10, 10, 10, 10, 0, -10,
+        -10, 5, 5, 10, 10, 5, 5, -10,
+        -10, 0, 5, 10, 10, 5, 0, -10,
+        -10, 0, 0, 0, 0, 0, 0, -10,
+        -20, -10, -10, -10, -10, -10, -10, -20,
+    ],
+    ROOK: [
+        0, 0, 0, 2, 2, 0, 0, 0,
+        -2, 0, 0, 0, 0, 0, 0, -2,
+        -2, 0, 0, 0, 0, 0, 0, -2,
+        -2, 0, 0, 0, 0, 0, 0, -2,
+        -2, 0, 0, 0, 0, 0, 0, -2,
+        -2, 0, 0, 0, 0, 0, 0, -2,
+        2, 4, 4, 4, 4, 4, 4, 2,
+        0, 0, 0, 0, 0, 0, 0, 0,
+    ],
+    QUEEN: [
+        -20, -10, -10, -5, -5, -10, -10, -20,
+        -10, 0, 0, 0, 0, 0, 0, -10,
+        -10, 0, 5, 5, 5, 5, 0, -10,
+        -5, 0, 5, 5, 5, 5, 0, -5,
+        0, 0, 5, 5, 5, 5, 0, -5,
+        -10, 5, 5, 5, 5, 5, 0, -10,
+        -10, 0, 5, 0, 0, 0, 0, -10,
+        -20, -10, -10, -5, -5, -10, -10, -20,
+    ],
+}
+
+# Cached file bitboards for eval and open-file checks (avoid recomputing every eval).
+FILE_BB = [0] * 8
+for _f in range(8):
+    for _r in range(8):
+        FILE_BB[_f] |= bit(sq_index(_f, _r))
+
+# Center squares (d4,d5,e4,e5) for piece interaction bonuses
+CENTER_SQS = {sq_index(3, 3), sq_index(3, 4), sq_index(4, 3), sq_index(4, 4)}
+
 PIECE_VALUES_MG = [100, 320, 330, 500, 900, 0]
 PIECE_VALUES_EG = [120, 300, 320, 500, 900, 0]
 
@@ -1116,7 +1194,7 @@ PHASE_WEIGHTS = (1, 1, 2, 4)
 
 
 def _piece_eval_contribution(color, piece, sq):
-    """Return (mg, eg) contribution of one piece on sq. Used for incremental eval."""
+    """Return (mg, eg) contribution of one piece on sq. Used for incremental eval. EG uses EG_PST for all pieces."""
     sign = 1 if color == WHITE else -1
     mirror_sq = sq ^ 56 if color == BLACK else sq
     if piece == KING:
@@ -1124,7 +1202,7 @@ def _piece_eval_contribution(color, piece, sq):
         eg = sign * (PIECE_VALUES_EG[KING] + EG_KING_PST[mirror_sq])
     else:
         mg = sign * (PIECE_VALUES_MG[piece] + MG_PST[piece][mirror_sq])
-        eg = sign * (PIECE_VALUES_EG[piece] + MG_PST[piece][mirror_sq])
+        eg = sign * (PIECE_VALUES_EG[piece] + EG_PST[piece][mirror_sq])
     return mg, eg
 
 
@@ -1189,10 +1267,13 @@ def eval_board(board: Board):
     phase = board.phase
     bishop_count = [0, 0]
     passed_pawns = [0, 0]
-
-    files_bb = [0] * 8
-    for sq in range(64):
-        files_bb[sq & 7] |= bit(sq)
+    passed_rank_bonus = [0, 0]  # extra by rank (closer to promotion)
+    doubled_pawns = [0, 0]
+    weak_pawns = [0, 0]
+    rook_open_bonus = [0, 0]
+    rook_semi_open_bonus = [0, 0]
+    knight_center_bonus = [0, 0]
+    bishop_center_bonus = [0, 0]
 
     for color in (WHITE, BLACK):
         for p in range(6):
@@ -1201,40 +1282,64 @@ def eval_board(board: Board):
                 sq, bb = pop_lsb(bb)
                 if p == BISHOP:
                     bishop_count[color] += 1
+                    if sq in CENTER_SQS:
+                        bishop_center_bonus[color] += 12
+                if p == KNIGHT and sq in CENTER_SQS:
+                    knight_center_bonus[color] += 15
+                if p == ROOK:
+                    f = sq & 7
+                    if is_open_file(board, f):
+                        rook_open_bonus[color] += 18
+                    else:
+                        our_pawns_on_f = FILE_BB[f] & board.bb[color][PAWN]
+                        if not our_pawns_on_f:
+                            rook_semi_open_bonus[color] += 10
                 if p == PAWN:
                     f = sq & 7
-                    ahead_sqs = []
-                    if color == WHITE:
-                        for r in range((sq >> 3) + 1, 8):
-                            ahead_sqs.append(sq_index(f, r))
-                    else:
-                        for r in range((sq >> 3) - 1, -1, -1):
-                            ahead_sqs.append(sq_index(f, r))
+                    pawn_rank = sq >> 3
                     ahead_mask = 0
-                    for s in ahead_sqs:
-                        ahead_mask |= bit(s)
-                    # opposing pawns in same or adjacent file ahead?
-                    opp_pawns = board.bb[1 - color][PAWN]
-                    neighbor_files = [f]
+                    if color == WHITE:
+                        for r in range(pawn_rank + 1, 8):
+                            ahead_mask |= bit(sq_index(f, r))
+                    else:
+                        for r in range(pawn_rank - 1, -1, -1):
+                            ahead_mask |= bit(sq_index(f, r))
+                    neighbor_mask = FILE_BB[f]
                     if f > 0:
-                        neighbor_files.append(f - 1)
+                        neighbor_mask |= FILE_BB[f - 1]
                     if f < 7:
-                        neighbor_files.append(f + 1)
-                    mask = 0
-                    for nf in neighbor_files:
-                        mask |= files_bb[nf]
-                    if not (opp_pawns & mask & ahead_mask):
+                        neighbor_mask |= FILE_BB[f + 1]
+                    opp_pawns = board.bb[1 - color][PAWN]
+                    if not (opp_pawns & neighbor_mask & ahead_mask):
                         passed_pawns[color] += 1
+                        rank_for_bonus = (pawn_rank if color == WHITE else (7 - pawn_rank))
+                        passed_rank_bonus[color] += rank_for_bonus * 8
+                    same_file_ours = FILE_BB[f] & board.bb[color][PAWN]
+                    if popcount(same_file_ours) > 1:
+                        doubled_pawns[color] += 1
+                    no_own_ahead = not (board.bb[color][PAWN] & ahead_mask)
+                    opp_adjacent = bool(opp_pawns & neighbor_mask)
+                    if no_own_ahead and opp_adjacent and (pawn_rank < 5 if color == WHITE else pawn_rank > 2):
+                        weak_pawns[color] += 1
 
-    # bishop pair
+    # Bishop pair: full bonus in MG, slightly less in EG when phase is low
+    bishop_pair_bonus = 30
     if bishop_count[WHITE] >= 2:
-        score += 30
+        score += bishop_pair_bonus
     if bishop_count[BLACK] >= 2:
-        score -= 30
+        score -= bishop_pair_bonus
 
-    # passed pawns bonus
-    score += 20 * passed_pawns[WHITE]
-    score -= 20 * passed_pawns[BLACK]
+    # Passed pawns: base + rank-based bonus (closer to promotion = more)
+    score += 20 * passed_pawns[WHITE] + passed_rank_bonus[WHITE]
+    score -= 20 * passed_pawns[BLACK] + passed_rank_bonus[BLACK]
+    score -= 15 * doubled_pawns[WHITE]
+    score += 15 * doubled_pawns[BLACK]
+    score -= 12 * weak_pawns[WHITE]
+    score += 12 * weak_pawns[BLACK]
+
+    # Piece interaction: rooks on open/semi-open files, pieces in center
+    score += rook_open_bonus[WHITE] + rook_semi_open_bonus[WHITE] + knight_center_bonus[WHITE] + bishop_center_bonus[WHITE]
+    score -= rook_open_bonus[BLACK] + rook_semi_open_bonus[BLACK] + knight_center_bonus[BLACK] + bishop_center_bonus[BLACK]
 
     mg_weight = phase
     eg_weight = 24 - phase
@@ -1256,7 +1361,7 @@ def eval_board(board: Board):
                     score -= sign * (max(50, val // 2))
 
     # --- King safety (eval): MG-only ---
-    # Avoid unnecessary exposure: open file, centralization without endgame.
+    # Open file, centre, pawn shield (pawns in front of king), attack weight.
     for color in (WHITE, BLACK):
         sign = 1 if color == WHITE else -1
         kbb = board.bb[color][KING]
@@ -1271,6 +1376,26 @@ def eval_board(board: Board):
             score -= sign * 22
         if 2 <= kf <= 5 and 2 <= kr <= 5:
             score -= sign * 12
+        # Pawn shield: bonus for pawns on 2-3 squares in front of king (MG)
+        shield_rank = kr + 1 if color == WHITE else kr - 1
+        if 0 <= shield_rank <= 7:
+            shield_bb = bit(sq_index(kf, shield_rank))
+            if kf > 0:
+                shield_bb |= bit(sq_index(kf - 1, shield_rank))
+            if kf < 7:
+                shield_bb |= bit(sq_index(kf + 1, shield_rank))
+            shield_count = popcount(shield_bb & board.bb[color][PAWN])
+            score += sign * shield_count * 14
+        # Attack weight: penalty for squares around king attacked by opponent
+        opp = 1 - color
+        attack_weight = 0
+        for d in KING_DELTAS:
+            nsq = ksq + d
+            if not in_bounds(nsq) or abs((nsq & 7) - kf) > 1:
+                continue
+            if is_square_attacked(board, nsq, opp):
+                attack_weight += 1
+        score -= sign * attack_weight * 8
 
     # --- Winning positions: extra king-exposure penalty ---
     # Avoid speculative king exposure / counterplay when clearly ahead.
@@ -1303,6 +1428,15 @@ INF = 10_000_000
 MATE_VALUE = 100_000
 
 
+def probe_syzygy(board: Board):
+    """
+    Syzygy tablebase probe (placeholder for future integration).
+    Returns (score_in_cp, success) or None if disabled/not in TB.
+    Call from search at leaf or low depth when material is in TB; no multithreading.
+    """
+    return None
+
+
 class TTEntry:
     __slots__ = ("key", "depth", "score", "flag", "move", "age")
 
@@ -1329,6 +1463,9 @@ class Searcher:
         self.stop = False
         self.best_move = None
         self.history_heur = defaultdict(int)
+        self.killer1 = {}  # killer1[ply] = (from_sq, to_sq, promo) for quiet moves that caused cutoff
+        self.killer2 = {}
+        self.counter_move = {}  # counter_move[(color_played, from, to, promo)] = (from, to, promo) of reply
         self.age = 0
         self.max_depth = 0
         self.root_moves = []
@@ -1338,6 +1475,9 @@ class Searcher:
     def clear(self):
         self.tt = [TTEntry() for _ in range(self.tt_size)]
         self.history_heur.clear()
+        self.killer1 = {}
+        self.killer2 = {}
+        self.counter_move = {}
         self.age = 0
 
     def probe_tt(self, key):
@@ -1349,8 +1489,14 @@ class Searcher:
     def store_tt(self, key, depth, score, flag, move):
         idx = key & (self.tt_size - 1)
         entry = self.tt[idx]
-        # Prefer replacing stale entries (from previous search) or lower-depth entries
-        if entry.key != key or depth >= entry.depth or entry.age != self.age:
+        # Replace: different position, stale age, or strictly better (deeper / same depth but we have EXACT)
+        replace = (
+            entry.key != key
+            or entry.age != self.age
+            or depth > entry.depth
+            or (depth == entry.depth and flag == TTEntry.EXACT and entry.flag != TTEntry.EXACT)
+        )
+        if replace:
             self.tt[idx] = TTEntry(key, depth, score, flag, move, self.age)
 
     def time_up(self):
@@ -1375,14 +1521,14 @@ class Searcher:
                 break
             self.age += 1
             self.order_board = self.root_board.clone()
-            score = self.negamax(board, depth, alpha, beta, 0, True)
+            score = self.negamax(board, depth, alpha, beta, 0, True, True, False, None)
             if self.time_up():
                 break
             last_score = score
             if score <= alpha or score >= beta:
                 alpha = -INF
                 beta = INF
-                score = self.negamax(board, depth, alpha, beta, 0, True)
+                score = self.negamax(board, depth, alpha, beta, 0, True, True, False, None)
                 if self.time_up():
                     break
             alpha = score - 50
@@ -1434,12 +1580,12 @@ class Searcher:
             return []
         return [self.best_move]
 
-    def negamax(self, board: Board, depth, alpha, beta, ply, root=False, allow_null=True, extended=False):
+    def negamax(self, board: Board, depth, alpha, beta, ply, root=False, allow_null=True, extended=False, prev_move=None):
         if self.time_up():
             return 0
         self.nodes += 1
 
-        # Check extension: one extra ply when in check, only at depth 1..4 and at most once in a row
+        # Extensions: in check (depth 1..4, once); pawn to 7th (rank 6 white / rank 1 black)
         do_extend = in_check(board) and 1 <= depth <= 4 and not extended
         next_depth = depth if do_extend else (depth - 1)
         next_extended = extended or do_extend
@@ -1505,23 +1651,37 @@ class Searcher:
 
         phase = board.phase
         order_board = getattr(self, "order_board", None)
+        stm = board.side_to_move
 
         def move_score(m):
             score = 0
             if tt_move and m.from_sq == tt_move.from_sq and m.to_sq == tt_move.to_sq and m.promo == tt_move.promo:
                 score += 10_000_000
+            if prev_move is not None:
+                key = (1 - stm, prev_move.from_sq, prev_move.to_sq, prev_move.promo)
+                c = self.counter_move.get(key)
+                if c and c[0] == m.from_sq and c[1] == m.to_sq and c[2] == m.promo:
+                    score += 3_000_000
+            if m.is_quiet():
+                k1 = self.killer1.get(ply)
+                if k1 and k1[0] == m.from_sq and k1[1] == m.to_sq and k1[2] == m.promo:
+                    score += 2_000_000
+                else:
+                    k2 = self.killer2.get(ply)
+                    if k2 and k2[0] == m.from_sq and k2[1] == m.to_sq and k2[2] == m.promo:
+                        score += 1_500_000
             if m.is_capture():
                 victim = m.capture if m.capture is not None else PAWN
                 attacker = m.piece
                 if attacker is None:
                     for pt in range(6):
-                        if bit(m.from_sq) & board.bb[board.side_to_move][pt]:
+                        if bit(m.from_sq) & board.bb[stm][pt]:
                             attacker = pt
                             break
                 score += 1000 * (
                             PIECE_VALUES_MG[victim] - (PIECE_VALUES_MG[attacker] if attacker is not None else 0) // 10)
             else:
-                score += self.history_heur[(board.side_to_move, m.from_sq, m.to_sq)]
+                score += self.history_heur[(stm, m.from_sq, m.to_sq)]
             # Move filtering (ordering): avoid moves that leave pieces en prise when alternatives exist.
             # Only at root, when not in check; heuristic-based. Penalty tries "safe" moves first.
             # SEE-lite: demote captures that can be recaptured by a cheaper piece (bad captures).
@@ -1568,7 +1728,7 @@ class Searcher:
         ):
             saved = make_null_move(board)
             null_score = -self.negamax(
-                board, depth - 1 - NULL_R, -beta, -beta + 1, ply + 1, root=False, allow_null=False, extended=next_extended
+                board, depth - 1 - NULL_R, -beta, -beta + 1, ply + 1, root=False, allow_null=False, extended=next_extended, prev_move=None
             )
             undo_null_move(board, saved)
             if self.time_up():
@@ -1577,12 +1737,10 @@ class Searcher:
                 return beta
 
         LMR_FULL_MOVES = 4  # Don't reduce first N moves (late moves only)
-        LMR_REDUCTION = 2  # Reduce depth by this for LMR try
 
         for i, m in enumerate(legal_moves):
             if not make_move(board, m):
                 continue
-            # Late Move Reduction: don't reduce checks or pawn pushes to 6th/7th rank
             gives_check = in_check(board)
             to_rank = m.to_sq >> 3
             moved_color = 1 - board.side_to_move
@@ -1590,6 +1748,13 @@ class Searcher:
                     m.piece == PAWN and not m.is_capture()
                     and ((moved_color == WHITE and to_rank in (5, 6)) or (moved_color == BLACK and to_rank in (1, 2)))
             )
+            pawn_to_7th = (
+                    m.piece == PAWN and not m.is_capture()
+                    and ((moved_color == WHITE and to_rank == 6) or (moved_color == BLACK and to_rank == 1))
+            )
+            effective_depth = next_depth
+            if pawn_to_7th and depth <= 4 and not next_extended:
+                effective_depth = depth
             do_lmr = (
                     depth >= 3
                     and i >= LMR_FULL_MOVES
@@ -1598,17 +1763,18 @@ class Searcher:
                     and not pawn_push_78
             )
             if do_lmr:
+                hist = self.history_heur.get((stm, m.from_sq, m.to_sq), 0)
+                lmr_reduction = 1 if hist > 8000 else 2
                 score = -self.negamax(
-                    board, next_depth - LMR_REDUCTION, -beta, -alpha, ply + 1, root=False, allow_null=True, extended=next_extended
+                    board, effective_depth - lmr_reduction, -beta, -alpha, ply + 1, root=False, allow_null=True, extended=next_extended, prev_move=m
                 )
                 if score > alpha:
-                    # Re-search at full depth if reduced search improved alpha
                     score = -self.negamax(
-                        board, next_depth, -beta, -alpha, ply + 1, root=False, allow_null=True, extended=next_extended
+                        board, effective_depth, -beta, -alpha, ply + 1, root=False, allow_null=True, extended=next_extended, prev_move=m
                     )
             else:
                 score = -self.negamax(
-                    board, next_depth, -beta, -alpha, ply + 1, root=False, allow_null=True, extended=next_extended
+                    board, effective_depth, -beta, -alpha, ply + 1, root=False, allow_null=True, extended=next_extended, prev_move=m
                 )
             undo_move(board)
             if self.time_up():
@@ -1619,12 +1785,21 @@ class Searcher:
             if score > alpha:
                 alpha = score
                 if not m.is_capture():
-                    self.history_heur[(board.side_to_move, m.from_sq, m.to_sq)] += depth * depth
+                    self.history_heur[(stm, m.from_sq, m.to_sq)] += depth * depth
             if alpha >= beta:
+                if m.is_quiet():
+                    if self.killer1.get(ply) != (m.from_sq, m.to_sq, m.promo):
+                        self.killer2[ply] = self.killer1.get(ply)
+                        self.killer1[ply] = (m.from_sq, m.to_sq, m.promo)
                 break
 
         if best_move is None:
             return 0
+
+        if prev_move is not None:
+            self.counter_move[(1 - stm, prev_move.from_sq, prev_move.to_sq, prev_move.promo)] = (
+                best_move.from_sq, best_move.to_sq, best_move.promo
+            )
 
         flag = TTEntry.EXACT
         if best_score <= original_alpha:
@@ -1653,12 +1828,31 @@ class Searcher:
         if stand_pat > alpha:
             alpha = stand_pat
 
-        moves = gen_moves(board, captures_only=True)
-        if not moves:
-            return stand_pat
-
-        for m in moves:
+        captures = gen_moves(board, captures_only=True)
+        for m in captures:
             if not m.is_capture() and not (m.flags & Move.EN_PASSANT):
+                continue
+            if not make_move(board, m):
+                continue
+            score = -self.quiescence(board, -beta, -alpha, ply + 1)
+            undo_move(board)
+            if self.time_up():
+                return 0
+            if score >= beta:
+                return beta
+            if score > alpha:
+                alpha = score
+
+        all_moves = gen_moves(board, captures_only=False)
+        for m in all_moves:
+            if m.is_capture() or (m.flags & Move.EN_PASSANT):
+                continue
+            to_search = m.promo is not None
+            if not to_search:
+                if make_move(board, m):
+                    to_search = in_check(board)
+                    undo_move(board)
+            if not to_search:
                 continue
             if not make_move(board, m):
                 continue
