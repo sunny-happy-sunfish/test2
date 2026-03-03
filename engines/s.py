@@ -184,6 +184,9 @@ ZOBRIST_CASTLING = [0] * 16
 ZOBRIST_EP = [0] * 64
 ZOBRIST_SIDE = 0
 
+FILE_MASKS = [0] * 8
+PASSED_PAWN_MASK = [[0] * 64 for _ in range(2)]
+
 
 def init_zobrist():
     global ZOBRIST_SIDE
@@ -197,6 +200,42 @@ def init_zobrist():
     for sq in range(64):
         ZOBRIST_EP[sq] = rnd.getrandbits(64)
     ZOBRIST_SIDE = rnd.getrandbits(64)
+
+
+def init_eval_tables():
+    for f in range(8):
+        mask = 0
+        for r in range(8):
+            mask |= bit(sq_index(f, r))
+        FILE_MASKS[f] = mask
+        if __debug__:
+            assert popcount(FILE_MASKS[f]) == 8
+
+    for color in (WHITE, BLACK):
+        for sq in range(64):
+            f = sq & 7
+            rank = sq >> 3
+            mask = 0
+            for nf in (f - 1, f, f + 1):
+                if nf < 0 or nf > 7:
+                    continue
+                if color == WHITE:
+                    for r in range(rank + 1, 8):
+                        mask |= bit(sq_index(nf, r))
+                else:
+                    for r in range(rank - 1, -1, -1):
+                        mask |= bit(sq_index(nf, r))
+            PASSED_PAWN_MASK[color][sq] = mask
+
+            if __debug__:
+                m = mask
+                while m:
+                    s, m = pop_lsb(m)
+                    sr = s >> 3
+                    if color == WHITE:
+                        assert sr > rank
+                    else:
+                        assert sr < rank
 
 
 def compute_hash(board: Board):
@@ -1058,10 +1097,6 @@ def eval_board(board: Board):
     bishop_count = [0, 0]
     passed_pawns = [0, 0]
 
-    files_bb = [0] * 8
-    for sq in range(64):
-        files_bb[sq & 7] |= bit(sq)
-
     for color in (WHITE, BLACK):
         sign = 1 if color == WHITE else -1
         for p in range(6):
@@ -1078,28 +1113,8 @@ def eval_board(board: Board):
                 if p == BISHOP:
                     bishop_count[color] += 1
                 if p == PAWN:
-                    f = sq & 7
-                    ahead_sqs = []
-                    if color == WHITE:
-                        for r in range((sq >> 3) + 1, 8):
-                            ahead_sqs.append(sq_index(f, r))
-                    else:
-                        for r in range((sq >> 3) - 1, -1, -1):
-                            ahead_sqs.append(sq_index(f, r))
-                    ahead_mask = 0
-                    for s in ahead_sqs:
-                        ahead_mask |= bit(s)
-                    # opposing pawns in same or adjacent file ahead?
                     opp_pawns = board.bb[1 - color][PAWN]
-                    neighbor_files = [f]
-                    if f > 0:
-                        neighbor_files.append(f - 1)
-                    if f < 7:
-                        neighbor_files.append(f + 1)
-                    mask = 0
-                    for nf in neighbor_files:
-                        mask |= files_bb[nf]
-                    if not (opp_pawns & mask & ahead_mask):
+                    if not (opp_pawns & PASSED_PAWN_MASK[color][sq]):
                         passed_pawns[color] += 1
 
     # bishop pair
@@ -1647,6 +1662,7 @@ class UCI:
 
 def main():
     init_zobrist()
+    init_eval_tables()
     uci = UCI()
     uci.loop()
 
