@@ -1192,6 +1192,7 @@ def eval_board(board: Board):
 
 INF = 10_000_000
 MATE_VALUE = 100_000
+MAX_PLY = 128
 
 
 class TTEntry:
@@ -1220,6 +1221,8 @@ class Searcher:
         self.stop = False
         self.best_move = None
         self.history_heur = defaultdict(int)
+        self.killers = [[None, None] for _ in range(MAX_PLY)]
+        self.countermove = {}
         self.age = 0
         self.max_depth = 0
         self.root_moves = []
@@ -1229,6 +1232,8 @@ class Searcher:
     def clear(self):
         self.tt = [TTEntry() for _ in range(self.tt_size)]
         self.history_heur.clear()
+        self.killers = [[None, None] for _ in range(MAX_PLY)]
+        self.countermove.clear()
         self.age = 0
 
     def probe_tt(self, key):
@@ -1372,6 +1377,13 @@ class Searcher:
 
         # Move ordering: TT move first, then MVV-LVA + history
         tt_move = tt_entry.move if tt_entry else None
+        prev = board.history[-1].move if board.history else None
+        prev_key = None
+        if prev is not None:
+            prev_key = (board.side_to_move, prev.from_sq, prev.to_sq, prev.promo)
+        cm = self.countermove.get(prev_key) if prev_key is not None else None
+        ply_idx = ply if ply < MAX_PLY else (MAX_PLY - 1)
+        killer0, killer1 = self.killers[ply_idx]
 
         # Filter out illegal TT move if present
         if tt_move is not None:
@@ -1404,6 +1416,13 @@ class Searcher:
                             break
                 score += 1000 * (PIECE_VALUES_MG[victim] - (PIECE_VALUES_MG[attacker] if attacker is not None else 0) // 10)
             else:
+                mt = (m.from_sq, m.to_sq, m.promo)
+                if killer0 is not None and mt == killer0:
+                    score += 900_000
+                elif killer1 is not None and mt == killer1:
+                    score += 800_000
+                elif cm is not None and mt == cm:
+                    score += 700_000
                 score += self.history_heur[(board.side_to_move, m.from_sq, m.to_sq)]
             # Move filtering (ordering): avoid moves that leave pieces en prise when alternatives exist.
             # Only at root, when not in check; heuristic-based. Penalty tries "safe" moves first.
@@ -1496,6 +1515,13 @@ class Searcher:
                 if not m.is_capture():
                     self.history_heur[(board.side_to_move, m.from_sq, m.to_sq)] += depth * depth
             if alpha >= beta:
+                if not m.is_capture():
+                    mt = (m.from_sq, m.to_sq, m.promo)
+                    if self.killers[ply_idx][0] != mt:
+                        self.killers[ply_idx][1] = self.killers[ply_idx][0]
+                        self.killers[ply_idx][0] = mt
+                    if prev_key is not None:
+                        self.countermove[prev_key] = mt
                 break
 
         if best_move is None:
