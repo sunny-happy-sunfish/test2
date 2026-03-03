@@ -682,10 +682,8 @@ def get_attackers(board: Board, sq, by_color):
 
 def is_open_file(board: Board, file):
     """True if there are no pawns on the given file (0..7)."""
-    mask = 0
-    for r in range(8):
-        mask |= bit(sq_index(file, r))
-    return not (mask & (board.bb[WHITE][PAWN] | board.bb[BLACK][PAWN]))
+    pawns = board.bb[WHITE][PAWN] | board.bb[BLACK][PAWN]
+    return not (FILE_MASKS[file] & pawns)
 
 
 def is_zugzwang_prone(board: Board):
