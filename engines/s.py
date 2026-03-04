@@ -1180,6 +1180,7 @@ def see(board: Board, move: Move):
         occ &= ~cap_bb
     else:
         bb[opp][captured] &= ~to_bb
+        occ &= ~to_bb
 
     bb[color][mover] |= to_bb
     occ |= to_bb
