@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
 import sys
-import math
 import time
 import random
 from collections import defaultdict
