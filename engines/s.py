@@ -1061,6 +1061,157 @@ def min_attacker_value(board: Board, sq, by_color):
     return min(PIECE_VALUES_MG[p] for p in a)
 
 
+def _see_least_attacker(board_bb, occ, sq, by_color):
+    # Pawns
+    if by_color == WHITE:
+        for from_sq in (sq - 9, sq - 7):
+            if in_bounds(from_sq) and abs((from_sq & 7) - (sq & 7)) == 1:
+                bb = bit(from_sq)
+                if (occ & bb) and (board_bb[WHITE][PAWN] & bb):
+                    return from_sq, PAWN
+    else:
+        for from_sq in (sq + 7, sq + 9):
+            if in_bounds(from_sq) and abs((from_sq & 7) - (sq & 7)) == 1:
+                bb = bit(from_sq)
+                if (occ & bb) and (board_bb[BLACK][PAWN] & bb):
+                    return from_sq, PAWN
+
+    # Knights
+    for d in KNIGHT_DELTAS:
+        from_sq = sq + d
+        if not in_bounds(from_sq) or abs((from_sq & 7) - (sq & 7)) > 2:
+            continue
+        bb = bit(from_sq)
+        if (occ & bb) and (board_bb[by_color][KNIGHT] & bb):
+            return from_sq, KNIGHT
+
+    # Bishops / Queens (diagonals)
+    sq_f = sq & 7
+    sq_r = sq >> 3
+    for d in BISHOP_DELTAS:
+        to = sq + d
+        while in_bounds(to):
+            to_f = to & 7
+            to_r = to >> 3
+            if abs(to_f - sq_f) != abs(to_r - sq_r):
+                break
+            bb = bit(to)
+            if occ & bb:
+                if board_bb[by_color][BISHOP] & bb:
+                    return to, BISHOP
+                if board_bb[by_color][QUEEN] & bb:
+                    return to, QUEEN
+                break
+            to += d
+
+    # Rooks / Queens (orthogonals)
+    for d in ROOK_DELTAS:
+        to = sq + d
+        while in_bounds(to):
+            to_f = to & 7
+            to_r = to >> 3
+            if d in (1, -1) and to_r != sq_r:
+                break
+            if d in (8, -8) and to_f != sq_f:
+                break
+            bb = bit(to)
+            if occ & bb:
+                if board_bb[by_color][ROOK] & bb:
+                    return to, ROOK
+                if board_bb[by_color][QUEEN] & bb:
+                    return to, QUEEN
+                break
+            to += d
+
+    # King (last)
+    for d in KING_DELTAS:
+        from_sq = sq + d
+        if not in_bounds(from_sq) or abs((from_sq & 7) - (sq & 7)) > 1:
+            continue
+        bb = bit(from_sq)
+        if (occ & bb) and (board_bb[by_color][KING] & bb):
+            return from_sq, KING
+
+    return None, None
+
+
+def see(board: Board, move: Move):
+    """Static Exchange Evaluation (cp) for captures on move.to_sq."""
+    if not move.is_capture():
+        return 0
+    if move.promo is not None:
+        return 0
+
+    color = board.side_to_move
+    opp = 1 - color
+    to_sq = move.to_sq
+    from_sq = move.from_sq
+
+    mover = move.piece
+    if mover is None:
+        for p in range(6):
+            if bit(from_sq) & board.bb[color][p]:
+                mover = p
+                break
+    if mover is None:
+        return 0
+
+    captured = move.capture
+    if move.flags & Move.EN_PASSANT:
+        captured = PAWN
+    if captured is None:
+        return 0
+
+    gains = [PIECE_VALUES_MG[captured]]
+
+    bb = [board.bb[WHITE][:], board.bb[BLACK][:]]
+    occ = board.all_occ
+
+    from_bb = bit(from_sq)
+    to_bb = bit(to_sq)
+
+    bb[color][mover] &= ~from_bb
+    occ &= ~from_bb
+
+    if move.flags & Move.EN_PASSANT:
+        cap_sq = to_sq - 8 if color == WHITE else to_sq + 8
+        cap_bb = bit(cap_sq)
+        bb[opp][PAWN] &= ~cap_bb
+        occ &= ~cap_bb
+    else:
+        bb[opp][captured] &= ~to_bb
+
+    bb[color][mover] |= to_bb
+    occ |= to_bb
+
+    attacker = mover
+    side = opp
+    d = 0
+
+    while True:
+        a_sq, a_pt = _see_least_attacker(bb, occ, to_sq, side)
+        if a_sq is None:
+            break
+        d += 1
+        gains.append(PIECE_VALUES_MG[attacker] - gains[d - 1])
+
+        a_from_bb = bit(a_sq)
+        bb[side][a_pt] &= ~a_from_bb
+        occ &= ~a_from_bb
+
+        bb[1 - side][attacker] &= ~to_bb
+        bb[side][a_pt] |= to_bb
+        occ |= to_bb
+
+        attacker = a_pt
+        side = 1 - side
+
+    while d > 0:
+        d -= 1
+        gains[d] = -max(-gains[d], gains[d + 1])
+    return gains[0]
+
+
 def hang_penalty_for_color(board: Board, color):
     """Heuristic penalty for pieces of color that are attacked and undefended. Used in move ordering."""
     opp = 1 - color
@@ -1444,6 +1595,7 @@ class Searcher:
                             attacker = pt
                             break
                 score += 1000 * (PIECE_VALUES_MG[victim] - (PIECE_VALUES_MG[attacker] if attacker is not None else 0) // 10)
+                score += 16 * see(board, m)
             else:
                 mt = (m.from_sq, m.to_sq, m.promo)
                 if killer0 is not None and mt == killer0:
@@ -1594,6 +1746,7 @@ class Searcher:
         return best_score
 
     def quiescence(self, board: Board, alpha, beta, ply):
+        SEE_QS_DELTA = 100
         if self.time_up():
             return 0
         self.nodes += 1
@@ -1610,6 +1763,11 @@ class Searcher:
         for m in moves:
             if not m.is_capture() and not (m.flags & Move.EN_PASSANT):
                 continue
+            if m.promo is None:
+                victim = m.capture if m.capture is not None else PAWN
+                if PIECE_VALUES_MG[victim] < PIECE_VALUES_MG[ROOK]:
+                    if see(board, m) < -SEE_QS_DELTA:
+                        continue
             if not make_move(board, m):
                 continue
             score = -self.quiescence(board, -beta, -alpha, ply + 1)
