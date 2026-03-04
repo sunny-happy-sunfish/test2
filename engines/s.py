@@ -1480,6 +1480,7 @@ class Searcher:
 
         LMR_FULL_MOVES = 4   # Don't reduce first N moves (late moves only)
         LMR_REDUCTION = 2    # Reduce depth by this for LMR try
+        first_move = True
 
         for i, m in enumerate(legal_moves):
             if not make_move(board, m):
@@ -1497,14 +1498,33 @@ class Searcher:
                 )
                 if score > alpha:
                     # Re-search at full depth if reduced search improved alpha
+                    if first_move:
+                        score = -self.negamax(
+                            board, depth - 1, -beta, -alpha, ply + 1, root=False, allow_null=True
+                        )
+                    else:
+                        score = -self.negamax(
+                            board, depth - 1, -(alpha + 1), -alpha, ply + 1, root=False, allow_null=True
+                        )
+                        if score > alpha:
+                            score = -self.negamax(
+                                board, depth - 1, -beta, -alpha, ply + 1, root=False, allow_null=True
+                            )
+            else:
+                if first_move:
                     score = -self.negamax(
                         board, depth - 1, -beta, -alpha, ply + 1, root=False, allow_null=True
                     )
-            else:
-                score = -self.negamax(
-                    board, depth - 1, -beta, -alpha, ply + 1, root=False, allow_null=True
-                )
+                else:
+                    score = -self.negamax(
+                        board, depth - 1, -(alpha + 1), -alpha, ply + 1, root=False, allow_null=True
+                    )
+                    if score > alpha:
+                        score = -self.negamax(
+                            board, depth - 1, -beta, -alpha, ply + 1, root=False, allow_null=True
+                        )
             undo_move(board)
+            first_move = False
             if self.time_up():
                 return 0
             if score > best_score:
