@@ -3,6 +3,8 @@
 import sys
 import time
 import random
+import queue
+import threading
 from collections import defaultdict
 
 """
@@ -1891,15 +1893,41 @@ class UCI:
         self.searcher = Searcher()
         self.uci_name = "StrawberryChess v4.1-preview-1"
         self.uci_author = "MK"
+        self.cmd_queue = queue.Queue()
+        self.quit_event = threading.Event()
 
-    def loop(self):
-        while True:
+    def _stdin_reader(self):
+        while not self.quit_event.is_set():
             line = sys.stdin.readline()
             if not line:
+                self.quit_event.set()
+                self.searcher.stop = True
                 break
+
             line = line.strip()
             if not line:
                 continue
+
+            if line == "stop":
+                self.searcher.stop = True
+                continue
+
+            if line == "quit":
+                self.quit_event.set()
+                self.searcher.stop = True
+
+            self.cmd_queue.put(line)
+
+    def loop(self):
+        input_thread = threading.Thread(target=self._stdin_reader, daemon=True)
+        input_thread.start()
+
+        while not self.quit_event.is_set():
+            try:
+                line = self.cmd_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
             if line == "uci":
                 self.cmd_uci()
             elif line == "isready":
@@ -1912,6 +1940,7 @@ class UCI:
                 self.searcher.clear()
                 set_fen(self.board, START_FEN)
             elif line == "quit":
+                self.quit_event.set()
                 break
             elif line == "stop":
                 self.searcher.stop = True
