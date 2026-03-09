@@ -1722,7 +1722,7 @@ class Searcher:
                 alpha = tt_score
             elif tt_entry.flag == TTEntry.UPPER and tt_score < beta:
                 beta = tt_score
-            if alpha >= beta:
+            if alpha >= beta and not root:
                 return tt_score
 
         legal_moves = gen_moves(board)
