@@ -1313,6 +1313,25 @@ def slider_mobility(board: Board, color, sq, deltas):
     return moves
 
 
+def king_shelter_penalty(board: Board, color, king_sq):
+    """Penalty for missing own pawns on 3 shelter squares in front of king."""
+    kf = king_sq & 7
+    kr = king_sq >> 3
+    front_rank = kr + 1 if color == WHITE else kr - 1
+    if front_rank < 0 or front_rank > 7:
+        return 0
+
+    pawns = board.bb[color][PAWN]
+    missing = 0
+    for f in (kf - 1, kf, kf + 1):
+        if f < 0 or f > 7:
+            continue
+        sq = sq_index(f, front_rank)
+        if not (pawns & bit(sq)):
+            missing += 1
+    return 10 * missing
+
+
 def eval_board(board: Board):
     # positive is good for side to move (we return from POV of side_to_move later)
     mg = 0
@@ -1435,6 +1454,7 @@ def eval_board(board: Board):
             score -= sign * 22
         if 2 <= kf <= 5 and 2 <= kr <= 5:
             score -= sign * 12
+        score -= sign * king_shelter_penalty(board, color, ksq)
 
     # --- Winning positions: extra king-exposure penalty ---
     # Avoid speculative king exposure / counterplay when clearly ahead.
