@@ -695,6 +695,22 @@ def is_semi_open_file(board: Board, color, file):
     return not (file_mask & own_pawns) and bool(file_mask & enemy_pawns)
 
 
+def is_isolated_pawn(pawns_bb, sq):
+    """True if pawn on sq has no friendly pawns on adjacent files."""
+    file = sq & 7
+    adjacent_files = 0
+    if file > 0:
+        adjacent_files |= FILE_MASKS[file - 1]
+    if file < 7:
+        adjacent_files |= FILE_MASKS[file + 1]
+    return not (pawns_bb & adjacent_files)
+
+
+def doubled_pawn_extras_on_file(pawns_bb, file):
+    """Number of extra pawns on a file (2 pawns => 1 extra, etc.)."""
+    return max(0, popcount(pawns_bb & FILE_MASKS[file]) - 1)
+
+
 def is_zugzwang_prone(board: Board):
     """
     True if null move should be disabled: pawn-only endgame or very low
@@ -1338,6 +1354,8 @@ def eval_board(board: Board):
         ROOK: 2,
         QUEEN: 1,
     }
+    ISOLATED_PAWN_PENALTY = 12
+    DOUBLED_PAWN_PENALTY = 10
     for color in (WHITE, BLACK):
         sign = 1 if color == WHITE else -1
 
@@ -1365,6 +1383,17 @@ def eval_board(board: Board):
         while bb:
             sq, bb = pop_lsb(bb)
             score += sign * MOBILITY_WEIGHTS[QUEEN] * slider_mobility(board, color, sq, BISHOP_DELTAS + ROOK_DELTAS)
+
+        pawns_bb = board.bb[color][PAWN]
+        pawns = pawns_bb
+        while pawns:
+            sq, pawns = pop_lsb(pawns)
+            if is_isolated_pawn(pawns_bb, sq):
+                score -= sign * ISOLATED_PAWN_PENALTY
+        for file in range(8):
+            extras = doubled_pawn_extras_on_file(pawns_bb, file)
+            if extras:
+                score -= sign * (DOUBLED_PAWN_PENALTY * extras)
 
     # passed pawns bonus
     score += 20 * passed_pawns[WHITE]
