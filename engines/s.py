@@ -1369,6 +1369,7 @@ class Searcher:
         self.nodes = 0
         self.start_time = 0
         self.stop_time = 0
+        self.soft_stop_time = 0
         self.stop = False
         self.best_move = None
         self.history_heur = defaultdict(int)
@@ -1402,10 +1403,11 @@ class Searcher:
     def time_up(self):
         return self.stop or (self.stop_time and time.time() >= self.stop_time)
 
-    def search(self, board: Board, max_depth, time_limit=None):
+    def search(self, board: Board, max_depth, time_limit=None, hard_time_limit=None):
         self.nodes = 0
         self.start_time = time.time()
-        self.stop_time = self.start_time + time_limit if time_limit else 0
+        self.soft_stop_time = self.start_time + time_limit if time_limit else 0
+        self.stop_time = self.start_time + hard_time_limit if hard_time_limit else self.soft_stop_time
         self.stop = False
         self.best_move = None
         self.root_board = board.clone()
@@ -1417,9 +1419,18 @@ class Searcher:
         beta = INF
         last_score = 0
         prev_score = 0
+        last_iter_time = 0.0
+        avg_iter_time = 0.0
+        iter_count = 0
         for depth in range(1, max_depth + 1):
+            now = time.time()
+            if last_iter_time > 0 and self.stop_time:
+                predicted_next_iter = last_iter_time * 2.2
+                if now + predicted_next_iter > self.stop_time:
+                    break
             if self.time_up():
                 break
+            iter_start = time.time()
             self.age += 1
             # Adaptive aspiration window: wider at small depth, narrower at larger depth,
             # and widened when score is volatile between iterations.
@@ -1463,6 +1474,19 @@ class Searcher:
             if self.time_up():
                 break
             prev_score, last_score = last_score, score
+
+            iter_elapsed = max(0.0001, time.time() - iter_start)
+            last_iter_time = iter_elapsed
+            iter_count += 1
+            avg_iter_time += (iter_elapsed - avg_iter_time) / iter_count
+
+            if depth > 1 and self.stop_time:
+                remaining = self.stop_time - time.time()
+                if (prev_score - last_score) > 120 and remaining < 2.0 * avg_iter_time:
+                    break
+                if remaining < 1.5 * avg_iter_time:
+                    break
+
             # send info
             elapsed = max(0.001, time.time() - self.start_time)
             nps = int(self.nodes / elapsed)
@@ -1843,6 +1867,14 @@ class UCI:
                     make_move(self.board, found)
                 idx += 1
 
+    def dynamic_moves_to_go(self):
+        pieces = popcount(self.board.all_occ)
+        if pieces <= 6:
+            return 12
+        if pieces <= 10:
+            return 18
+        return 28
+
     def cmd_go(self, line):
         parts = line.split()
         wtime = btime = winc = binc = movestogo = None
@@ -1875,17 +1907,35 @@ class UCI:
                 i += 1
 
         time_limit = None
+        hard_time_limit = None
         if movetime is not None:
             time_limit = movetime / 1000.0
         elif wtime is not None and btime is not None:
             my_time = wtime if self.board.side_to_move == WHITE else btime
-            my_inc = winc if self.board.side_to_move == WHITE else binc
-            if movestogo is None:
-                movestogo = 30
-            time_limit = max(0.05, (my_time / movestogo + (my_inc or 0)) / 1000.0 * 0.7)
+            my_inc = (winc if self.board.side_to_move == WHITE else binc) or 0
+
+            reserve = max(50, int(0.02 * my_time)) + 20
+            remaining_safe = max(0, my_time - reserve)
+
+            est_moves = movestogo if movestogo is not None else self.dynamic_moves_to_go()
+            base = remaining_safe / max(1, est_moves)
+
+            if my_time <= 15000:
+                inc_factor = 0.9
+            elif my_time >= 120000:
+                inc_factor = 0.6
+            else:
+                inc_factor = 0.7
+
+            soft_budget = base + inc_factor * my_inc
+            soft_budget = max(20.0, min(soft_budget, 0.25 * remaining_safe if remaining_safe > 0 else 20.0))
+
+            hard_budget = min(remaining_safe, soft_budget * 3.0)
+            time_limit = soft_budget / 1000.0
+            hard_time_limit = hard_budget / 1000.0
 
         self.searcher.stop = False
-        best = self.searcher.search(self.board, depth, time_limit)
+        best = self.searcher.search(self.board, depth, time_limit, hard_time_limit)
         if best is None:
             print("bestmove 0000", flush=True)
         else:
