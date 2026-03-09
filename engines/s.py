@@ -687,6 +687,14 @@ def is_open_file(board: Board, file):
     return not (FILE_MASKS[file] & pawns)
 
 
+def is_semi_open_file(board: Board, color, file):
+    """True if file has no own pawns but has at least one enemy pawn."""
+    own_pawns = board.bb[color][PAWN]
+    enemy_pawns = board.bb[1 - color][PAWN]
+    file_mask = FILE_MASKS[file]
+    return not (file_mask & own_pawns) and bool(file_mask & enemy_pawns)
+
+
 def is_zugzwang_prone(board: Board):
     """
     True if null move should be disabled: pawn-only endgame or very low
@@ -1347,6 +1355,11 @@ def eval_board(board: Board):
         while bb:
             sq, bb = pop_lsb(bb)
             score += sign * MOBILITY_WEIGHTS[ROOK] * slider_mobility(board, color, sq, ROOK_DELTAS)
+            file = sq & 7
+            if is_open_file(board, file):
+                score += sign * 20
+            elif is_semi_open_file(board, color, file):
+                score += sign * 10
 
         bb = board.bb[color][QUEEN]
         while bb:
