@@ -1561,6 +1561,7 @@ class Searcher:
         beta = INF
         last_score = 0
         prev_score = 0
+        prev_iter_best_move = None
         last_iter_time = 0.0
         avg_iter_time = 0.0
         iter_count = 0
@@ -1616,6 +1617,7 @@ class Searcher:
             if self.time_up():
                 break
             prev_score, last_score = last_score, score
+            prev_iter_best_move = self.best_move
 
             iter_elapsed = max(0.0001, time.time() - iter_start)
             last_iter_time = iter_elapsed
@@ -1646,16 +1648,28 @@ class Searcher:
 
         # Final safety check: ensure reported best move is legal in the current root position.
         legal_root_moves = gen_moves(board)
+        def is_legal_root_move(candidate):
+            if candidate is None:
+                return False
+            return any(
+                m.from_sq == candidate.from_sq
+                and m.to_sq == candidate.to_sq
+                and m.promo == candidate.promo
+                for m in legal_root_moves
+            )
+
         if not legal_root_moves:
             self.best_move = None
-        elif self.best_move is None or not any(
-            m.from_sq == self.best_move.from_sq
-            and m.to_sq == self.best_move.to_sq
-            and m.promo == self.best_move.promo
-            for m in legal_root_moves
-        ):
-            # Fall back to the first legal move.
-            self.best_move = legal_root_moves[0]
+        elif not is_legal_root_move(self.best_move):
+            # Fallback order: root TT move, previous iteration best, then first legal.
+            root_tt_entry = self.probe_tt(board.zobrist_key)
+            tt_root_move = root_tt_entry.move if root_tt_entry else None
+            if is_legal_root_move(tt_root_move):
+                self.best_move = tt_root_move
+            elif is_legal_root_move(prev_iter_best_move):
+                self.best_move = prev_iter_best_move
+            else:
+                self.best_move = legal_root_moves[0]
 
         return self.best_move
 
@@ -1702,7 +1716,7 @@ class Searcher:
                 tt_score -= ply
             elif tt_score < -MATE_VALUE + 1000:
                 tt_score += ply
-            if tt_entry.flag == TTEntry.EXACT:
+            if tt_entry.flag == TTEntry.EXACT and not root:
                 return tt_score
             elif tt_entry.flag == TTEntry.LOWER and tt_score > alpha:
                 alpha = tt_score
