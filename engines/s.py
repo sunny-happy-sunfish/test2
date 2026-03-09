@@ -1239,6 +1239,54 @@ def bad_capture_ordering_penalty(board: Board, to_sq, our_piece_value, opp_color
     return min(100, max(20, loss // 5))
 
 
+def knight_mobility(board: Board, color, sq):
+    """Count knight destination squares excluding own occupied squares."""
+    own_occ = board.occ[color]
+    moves = 0
+    for d in KNIGHT_DELTAS:
+        to = sq + d
+        if not in_bounds(to):
+            continue
+        if abs((to & 7) - (sq & 7)) > 2:
+            continue
+        if bit(to) & own_occ:
+            continue
+        moves += 1
+    return moves
+
+
+def slider_mobility(board: Board, color, sq, deltas):
+    """Count reachable ray squares until first blocker (enemy blocker square counts)."""
+    own_occ = board.occ[color]
+    all_occ = board.all_occ
+    from_file = sq & 7
+    from_rank = sq >> 3
+    moves = 0
+
+    for d in deltas:
+        to = sq + d
+        while in_bounds(to):
+            to_file = to & 7
+            to_rank = to >> 3
+            if d in (1, -1) and to_rank != from_rank:
+                break
+            if d in (8, -8) and to_file != from_file:
+                break
+            if d in (9, 7, -7, -9):
+                if abs(to_file - from_file) != abs(to_rank - from_rank):
+                    break
+
+            to_bb = bit(to)
+            if to_bb & own_occ:
+                break
+
+            moves += 1
+            if to_bb & all_occ:
+                break
+            to += d
+    return moves
+
+
 def eval_board(board: Board):
     # positive is good for side to move (we return from POV of side_to_move later)
     mg = 0
@@ -1272,6 +1320,36 @@ def eval_board(board: Board):
         score += 30
     if bishop_count[BLACK] >= 2:
         score -= 30
+
+    # mobility bonus (cheap, local): knight / bishop / rook / queen
+    MOBILITY_WEIGHTS = {
+        KNIGHT: 3,
+        BISHOP: 4,
+        ROOK: 2,
+        QUEEN: 1,
+    }
+    for color in (WHITE, BLACK):
+        sign = 1 if color == WHITE else -1
+
+        bb = board.bb[color][KNIGHT]
+        while bb:
+            sq, bb = pop_lsb(bb)
+            score += sign * MOBILITY_WEIGHTS[KNIGHT] * knight_mobility(board, color, sq)
+
+        bb = board.bb[color][BISHOP]
+        while bb:
+            sq, bb = pop_lsb(bb)
+            score += sign * MOBILITY_WEIGHTS[BISHOP] * slider_mobility(board, color, sq, BISHOP_DELTAS)
+
+        bb = board.bb[color][ROOK]
+        while bb:
+            sq, bb = pop_lsb(bb)
+            score += sign * MOBILITY_WEIGHTS[ROOK] * slider_mobility(board, color, sq, ROOK_DELTAS)
+
+        bb = board.bb[color][QUEEN]
+        while bb:
+            sq, bb = pop_lsb(bb)
+            score += sign * MOBILITY_WEIGHTS[QUEEN] * slider_mobility(board, color, sq, BISHOP_DELTAS + ROOK_DELTAS)
 
     # passed pawns bonus
     score += 20 * passed_pawns[WHITE]
