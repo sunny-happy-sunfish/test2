@@ -996,6 +996,25 @@ def move_causes_repetition(board: Board, move: Move, threshold=3):
     return repeated
 
 
+def move_allows_immediate_repetition(board: Board, move: Move):
+    """Check whether opponent has an immediate legal reply that repeats a seen position."""
+    if not make_move(board, move):
+        return False
+
+    allows_repetition = False
+    for reply in gen_moves(board):
+        if not make_move(board, reply):
+            continue
+        if board.hash_history.count(board.zobrist_key) >= 2:
+            allows_repetition = True
+            undo_move(board)
+            break
+        undo_move(board)
+
+    undo_move(board)
+    return allows_repetition
+
+
 # Evaluation
 
 MG_PST = {
@@ -1901,6 +1920,8 @@ class Searcher:
             if self.time_up():
                 return 0
             if repetition_after_move and score > 150:
+                score = 0
+            if root and score > 150 and move_allows_immediate_repetition(board, m):
                 score = 0
             if score > best_score:
                 best_score = score
