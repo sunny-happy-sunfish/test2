@@ -1704,15 +1704,11 @@ class Searcher:
             return 0
         self.nodes += 1
 
-        # repetition and fifty-move
-        if board.halfmove_clock >= 100 or board.hash_history.count(board.zobrist_key) >= 3:
-            # anti-threefold in winning positions: if eval > threshold, avoid draw
-            stand_pat = eval_board(board)
-            if stand_pat > 80 and not root:
-                # don't accept; treat as bad draw
-                pass
-            else:
-                return 0
+        # repetition and fifty-move are immediate draws
+        if board.halfmove_clock >= 100:
+            return 0
+        if board.hash_history.count(board.zobrist_key) >= 3:
+            return 0
 
         if depth <= 0:
             return self.quiescence(board, alpha, beta, ply)
