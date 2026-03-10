@@ -1899,6 +1899,8 @@ class Searcher:
             first_move = False
             if self.time_up():
                 return 0
+            if root and root_winning_now and move_causes_repetition(board, m, threshold=3):
+                score = 0
             if score > best_score:
                 best_score = score
                 best_move = m
