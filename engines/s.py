@@ -1857,6 +1857,7 @@ class Searcher:
         for i, m in enumerate(legal_moves):
             if not make_move(board, m):
                 continue
+            repetition_after_move = root and (board.hash_history.count(board.zobrist_key) >= 2)
             # Late Move Reduction: only for late quiet non-checking moves at sufficient depth.
             do_lmr = (
                 depth >= 3
@@ -1899,7 +1900,7 @@ class Searcher:
             first_move = False
             if self.time_up():
                 return 0
-            if root and move_causes_repetition(board, m, threshold=2) and score > 150:
+            if repetition_after_move and score > 150:
                 score = 0
             if score > best_score:
                 best_score = score
