@@ -987,6 +987,15 @@ def undo_move(board: Board):
         board.all_occ ^= rf_bb
 
 
+def move_causes_repetition(board: Board, move: Move, threshold=3):
+    """Check whether `move` reaches a position repeated `threshold` times."""
+    if not make_move(board, move):
+        return False
+    repeated = board.hash_history.count(board.zobrist_key) >= threshold
+    undo_move(board)
+    return repeated
+
+
 # Evaluation
 
 MG_PST = {
@@ -1762,6 +1771,9 @@ class Searcher:
 
         phase = game_phase(board)
         order_board = getattr(self, "order_board", None)
+        ROOT_WINNING_EVAL_THRESHOLD = 150
+        ROOT_REPETITION_ORDERING_PENALTY = 500_000
+        root_winning_now = root and eval_board(board) > ROOT_WINNING_EVAL_THRESHOLD
 
         def move_score(m):
             score = 0
@@ -1790,6 +1802,8 @@ class Searcher:
             # Only at root, when not in check; heuristic-based. Penalty tries "safe" moves first.
             # SEE-lite: demote captures that can be recaptured by a cheaper piece (bad captures).
             if root and order_board is not None and not in_check(board):
+                if root_winning_now and move_causes_repetition(order_board, m, threshold=3):
+                    score -= ROOT_REPETITION_ORDERING_PENALTY
                 if make_move(order_board, m):
                     us = 1 - order_board.side_to_move
                     penalty = hang_penalty_for_color(order_board, us)
