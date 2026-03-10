@@ -756,6 +756,7 @@ class Undo:
         "halfmove_clock",
         "fullmove_number",
         "zobrist_key",
+        "history_pushed",
     )
 
     def __init__(self, move, board: Board):
@@ -765,6 +766,7 @@ class Undo:
         self.halfmove_clock = board.halfmove_clock
         self.fullmove_number = board.fullmove_number
         self.zobrist_key = board.zobrist_key
+        self.history_pushed = False
 
 
 def make_move(board: Board, move: Move, legal_check_only=False):
@@ -913,6 +915,7 @@ def make_move(board: Board, move: Move, legal_check_only=False):
 
     if not legal_check_only:
         board.hash_history.append(board.zobrist_key)
+        undo.history_pushed = True
     return True
 
 
@@ -928,7 +931,7 @@ def undo_move(board: Board):
     board.halfmove_clock = undo.halfmove_clock
     board.fullmove_number = undo.fullmove_number
     board.zobrist_key = undo.zobrist_key
-    if board.hash_history:
+    if undo.history_pushed and board.hash_history:
         board.hash_history.pop()
 
     from_bb = bit(move.from_sq)
