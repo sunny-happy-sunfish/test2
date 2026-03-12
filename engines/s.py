@@ -1881,11 +1881,12 @@ class Searcher:
             if not make_move(board, m):
                 continue
             repetition_after_move = root and (board.hash_history.count(board.zobrist_key) >= 2)
-            # Late Move Reduction: only for late quiet non-checking moves at sufficient depth.
+            # Late Move Reduction: only for late quiet, non-promotion, non-checking moves.
             do_lmr = (
                 depth >= 3
                 and i >= LMR_FULL_MOVES
                 and m.is_quiet()
+                and m.promo is None
                 and not in_check(board)   # do not reduce checking moves
             )
             if do_lmr:
@@ -1893,19 +1894,10 @@ class Searcher:
                     board, depth - 1 - LMR_REDUCTION, -beta, -alpha, ply + 1, root=False, allow_null=True
                 )
                 if score > alpha:
-                    # Re-search at full depth if reduced search improved alpha
-                    if first_move:
-                        score = -self.negamax(
-                            board, depth - 1, -beta, -alpha, ply + 1, root=False, allow_null=True
-                        )
-                    else:
-                        score = -self.negamax(
-                            board, depth - 1, -(alpha + 1), -alpha, ply + 1, root=False, allow_null=True
-                        )
-                        if score > alpha:
-                            score = -self.negamax(
-                                board, depth - 1, -beta, -alpha, ply + 1, root=False, allow_null=True
-                            )
+                    # Reduced result can only trigger a full-depth re-search.
+                    score = -self.negamax(
+                        board, depth - 1, -beta, -alpha, ply + 1, root=False, allow_null=True
+                    )
             else:
                 if first_move:
                     score = -self.negamax(
