@@ -1096,6 +1096,7 @@ EG_KING_PST = [
 
 PIECE_VALUES_MG = [100, 320, 330, 500, 900, 0]
 PIECE_VALUES_EG = [120, 300, 320, 500, 900, 0]
+QS_DELTA_MARGIN = 120
 
 
 def game_phase(board: Board):
@@ -1968,6 +1969,7 @@ class Searcher:
         if self.time_up():
             return 0
         self.nodes += 1
+        stm_in_check = in_check(board)
         stand_pat = eval_board(board)
         if stand_pat >= beta:
             return beta
@@ -1981,6 +1983,11 @@ class Searcher:
         for m in moves:
             if not m.is_capture() and not (m.flags & Move.EN_PASSANT):
                 continue
+            if not stm_in_check and m.promo is None:
+                victim = m.capture if m.capture is not None else (PAWN if (m.flags & Move.EN_PASSANT) else None)
+                if victim is not None and victim != QUEEN:
+                    if stand_pat + PIECE_VALUES_MG[victim] + QS_DELTA_MARGIN <= alpha:
+                        continue
             if m.promo is None:
                 victim = m.capture if m.capture is not None else PAWN
                 if PIECE_VALUES_MG[victim] < PIECE_VALUES_MG[ROOK]:
