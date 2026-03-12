@@ -1589,8 +1589,6 @@ class Searcher:
         self.root_moves = gen_moves(board)
         self.max_depth = max_depth
 
-        alpha = -INF
-        beta = INF
         last_score = 0
         prev_score = 0
         prev_iter_best_move = None
@@ -1607,45 +1605,8 @@ class Searcher:
                 break
             iter_start = time.time()
             self.age += 1
-            # Adaptive aspiration window: wider at small depth, narrower at larger depth,
-            # and widened when score is volatile between iterations.
-            base_window = max(25, 90 - 4 * depth)
-            volatility = abs(last_score - prev_score) if depth > 1 else 0
-            window = max(base_window, volatility + 20)
-            center = last_score if depth > 1 else 0
-            alpha = max(-INF, center - window)
-            beta = min(INF, center + window)
-
-            max_expansions = 5
-            expansions = 0
-            while True:
-                self.order_board = self.root_board.clone()
-                score = self.negamax(board, depth, alpha, beta, 0, True)
-                if self.time_up():
-                    break
-                if score <= alpha:
-                    if expansions >= max_expansions:
-                        alpha = -INF
-                        beta = INF
-                        self.order_board = self.root_board.clone()
-                        score = self.negamax(board, depth, alpha, beta, 0, True)
-                        break
-                    alpha = max(-INF, alpha - window)
-                    window = min(INF // 2, window * 2)
-                    expansions += 1
-                    continue
-                if score >= beta:
-                    if expansions >= max_expansions:
-                        alpha = -INF
-                        beta = INF
-                        self.order_board = self.root_board.clone()
-                        score = self.negamax(board, depth, alpha, beta, 0, True)
-                        break
-                    beta = min(INF, beta + window)
-                    window = min(INF // 2, window * 2)
-                    expansions += 1
-                    continue
-                break
+            self.order_board = self.root_board.clone()
+            score = self.negamax(board, depth, -INF, INF, 0, True)
             if self.time_up():
                 break
             prev_score, last_score = last_score, score
