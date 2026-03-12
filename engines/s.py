@@ -1824,8 +1824,12 @@ class Searcher:
         LMR_FULL_MOVES = 4   # Don't reduce first N moves (late moves only)
         LMR_REDUCTION = 2    # Reduce depth by this for LMR try
         first_move = True
+        stm_in_check = in_check(board)
 
         for i, m in enumerate(legal_moves):
+            # Diagnostic: temporarily skip negative-SEE captures in main search.
+            if m.is_capture() and m.promo is None and not stm_in_check and see(board, m) < 0:
+                continue
             if not make_move(board, m):
                 continue
             repetition_after_move = root and (board.hash_history.count(board.zobrist_key) >= 2)
