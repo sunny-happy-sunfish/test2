@@ -1589,6 +1589,8 @@ class Searcher:
         self.root_moves = gen_moves(board)
         self.max_depth = max_depth
 
+        alpha = -INF
+        beta = INF
         last_score = 0
         prev_score = 0
         prev_iter_best_move = None
@@ -1605,8 +1607,45 @@ class Searcher:
                 break
             iter_start = time.time()
             self.age += 1
-            self.order_board = self.root_board.clone()
-            score = self.negamax(board, depth, -INF, INF, 0, True)
+            # Adaptive aspiration window: wider at small depth, narrower at larger depth,
+            # and widened when score is volatile between iterations.
+            base_window = max(25, 90 - 4 * depth)
+            volatility = abs(last_score - prev_score) if depth > 1 else 0
+            window = max(base_window, volatility + 20)
+            center = last_score if depth > 1 else 0
+            alpha = max(-INF, center - window)
+            beta = min(INF, center + window)
+
+            max_expansions = 5
+            expansions = 0
+            while True:
+                self.order_board = self.root_board.clone()
+                score = self.negamax(board, depth, alpha, beta, 0, True)
+                if self.time_up():
+                    break
+                if score <= alpha:
+                    if expansions >= max_expansions:
+                        alpha = -INF
+                        beta = INF
+                        self.order_board = self.root_board.clone()
+                        score = self.negamax(board, depth, alpha, beta, 0, True)
+                        break
+                    alpha = max(-INF, alpha - window)
+                    window = min(INF // 2, window * 2)
+                    expansions += 1
+                    continue
+                if score >= beta:
+                    if expansions >= max_expansions:
+                        alpha = -INF
+                        beta = INF
+                        self.order_board = self.root_board.clone()
+                        score = self.negamax(board, depth, alpha, beta, 0, True)
+                        break
+                    beta = min(INF, beta + window)
+                    window = min(INF // 2, window * 2)
+                    expansions += 1
+                    continue
+                break
             if self.time_up():
                 break
             prev_score, last_score = last_score, score
@@ -1698,8 +1737,21 @@ class Searcher:
             return self.quiescence(board, alpha, beta, ply)
 
         key = board.zobrist_key
-        # Diagnostic: temporarily disable transposition-table probing in search.
-        tt_entry = None
+        tt_entry = self.probe_tt(key)
+        if tt_entry and tt_entry.depth >= depth:
+            tt_score = tt_entry.score
+            if tt_score > MATE_VALUE - 1000:
+                tt_score -= ply
+            elif tt_score < -MATE_VALUE + 1000:
+                tt_score += ply
+            if tt_entry.flag == TTEntry.EXACT and not root:
+                return tt_score
+            elif tt_entry.flag == TTEntry.LOWER and tt_score > alpha:
+                alpha = tt_score
+            elif tt_entry.flag == TTEntry.UPPER and tt_score < beta:
+                beta = tt_score
+            if alpha >= beta and not root:
+                return tt_score
 
         legal_moves = gen_moves(board)
         if not legal_moves:
@@ -1712,8 +1764,8 @@ class Searcher:
         best_score = -INF
         best_move = None
 
-        # Diagnostic: temporarily disable transposition-table move ordering.
-        tt_move = None
+        # Move ordering: TT move first, then MVV-LVA + history
+        tt_move = tt_entry.move if tt_entry else None
         prev = board.history[-1].move if board.history else None
         prev_key = None
         if prev is not None:
@@ -1824,21 +1876,16 @@ class Searcher:
         LMR_FULL_MOVES = 4   # Don't reduce first N moves (late moves only)
         LMR_REDUCTION = 2    # Reduce depth by this for LMR try
         first_move = True
-        stm_in_check = in_check(board)
 
         for i, m in enumerate(legal_moves):
-            # Diagnostic: temporarily skip negative-SEE captures in main search.
-            if m.is_capture() and m.promo is None and not stm_in_check and see(board, m) < 0:
-                continue
             if not make_move(board, m):
                 continue
             repetition_after_move = root and (board.hash_history.count(board.zobrist_key) >= 2)
-            # Late Move Reduction: only for late quiet, non-promotion, non-checking moves.
+            # Late Move Reduction: only for late quiet non-checking moves at sufficient depth.
             do_lmr = (
                 depth >= 3
                 and i >= LMR_FULL_MOVES
                 and m.is_quiet()
-                and m.promo is None
                 and not in_check(board)   # do not reduce checking moves
             )
             if do_lmr:
@@ -1846,10 +1893,19 @@ class Searcher:
                     board, depth - 1 - LMR_REDUCTION, -beta, -alpha, ply + 1, root=False, allow_null=True
                 )
                 if score > alpha:
-                    # Reduced result can only trigger a full-depth re-search.
-                    score = -self.negamax(
-                        board, depth - 1, -beta, -alpha, ply + 1, root=False, allow_null=True
-                    )
+                    # Re-search at full depth if reduced search improved alpha
+                    if first_move:
+                        score = -self.negamax(
+                            board, depth - 1, -beta, -alpha, ply + 1, root=False, allow_null=True
+                        )
+                    else:
+                        score = -self.negamax(
+                            board, depth - 1, -(alpha + 1), -alpha, ply + 1, root=False, allow_null=True
+                        )
+                        if score > alpha:
+                            score = -self.negamax(
+                                board, depth - 1, -beta, -alpha, ply + 1, root=False, allow_null=True
+                            )
             else:
                 if first_move:
                     score = -self.negamax(
@@ -1902,8 +1958,7 @@ class Searcher:
             store_score += ply
         elif store_score < -MATE_VALUE + 1000:
             store_score -= ply
-        # Diagnostic: temporarily disable transposition-table storing in search.
-        # self.store_tt(key, depth, store_score, flag, best_move if not root else best_move)
+        self.store_tt(key, depth, store_score, flag, best_move if not root else best_move)
 
         if root:
             self.best_move = best_move
