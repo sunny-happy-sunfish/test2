@@ -1698,21 +1698,8 @@ class Searcher:
             return self.quiescence(board, alpha, beta, ply)
 
         key = board.zobrist_key
-        tt_entry = self.probe_tt(key)
-        if tt_entry and tt_entry.depth >= depth:
-            tt_score = tt_entry.score
-            if tt_score > MATE_VALUE - 1000:
-                tt_score -= ply
-            elif tt_score < -MATE_VALUE + 1000:
-                tt_score += ply
-            if tt_entry.flag == TTEntry.EXACT and not root:
-                return tt_score
-            elif tt_entry.flag == TTEntry.LOWER and tt_score > alpha:
-                alpha = tt_score
-            elif tt_entry.flag == TTEntry.UPPER and tt_score < beta:
-                beta = tt_score
-            if alpha >= beta and not root:
-                return tt_score
+        # Diagnostic: temporarily disable transposition-table probing in search.
+        tt_entry = None
 
         legal_moves = gen_moves(board)
         if not legal_moves:
@@ -1725,8 +1712,8 @@ class Searcher:
         best_score = -INF
         best_move = None
 
-        # Move ordering: TT move first, then MVV-LVA + history
-        tt_move = tt_entry.move if tt_entry else None
+        # Diagnostic: temporarily disable transposition-table move ordering.
+        tt_move = None
         prev = board.history[-1].move if board.history else None
         prev_key = None
         if prev is not None:
@@ -1911,7 +1898,8 @@ class Searcher:
             store_score += ply
         elif store_score < -MATE_VALUE + 1000:
             store_score -= ply
-        self.store_tt(key, depth, store_score, flag, best_move if not root else best_move)
+        # Diagnostic: temporarily disable transposition-table storing in search.
+        # self.store_tt(key, depth, store_score, flag, best_move if not root else best_move)
 
         if root:
             self.best_move = best_move
