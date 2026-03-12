@@ -1792,6 +1792,8 @@ class Searcher:
         order_board = getattr(self, "order_board", None)
         ROOT_WINNING_EVAL_THRESHOLD = 150
         ROOT_REPETITION_ORDERING_PENALTY = 500_000
+        BAD_CAPTURE_PENALTY = 200_000
+        BAD_CAPTURE_SEE_SCALE = 32
         root_winning_now = root and eval_board(board) > ROOT_WINNING_EVAL_THRESHOLD
 
         def move_score(m):
@@ -1807,7 +1809,10 @@ class Searcher:
                             attacker = pt
                             break
                 score += 1000 * (PIECE_VALUES_MG[victim] - (PIECE_VALUES_MG[attacker] if attacker is not None else 0) // 10)
-                score += 16 * see(board, m)
+                see_score = see(board, m)
+                score += 16 * see_score
+                if m.promo is None and not in_check(board) and see_score < 0:
+                    score -= BAD_CAPTURE_PENALTY + (-see_score * BAD_CAPTURE_SEE_SCALE)
             else:
                 mt = (m.from_sq, m.to_sq, m.promo)
                 if killer0 is not None and mt == killer0:
