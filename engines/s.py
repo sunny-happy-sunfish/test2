@@ -1933,13 +1933,10 @@ class Searcher:
                 score = 0
             if root and score > 150 and move_allows_immediate_repetition(board, m):
                 score = 0
-            if (
-                m.is_capture()
-                and m.promo is None
-                and not was_in_check_before_loop
-                and see(board, m) < 0
-            ):
-                score = min(score, 0)
+            if m.is_capture() and m.promo is None and not was_in_check_before_loop:
+                cap_see = see(board, m)
+                if cap_see < 0:
+                    score += cap_see
             if score > best_score:
                 best_score = score
                 best_move = m
