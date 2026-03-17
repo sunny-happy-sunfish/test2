@@ -1594,6 +1594,9 @@ class Searcher:
         last_score = 0
         prev_score = 0
         prev_iter_best_move = None
+        completed_best_move = None
+        completed_score = 0
+        completed_pv = []
         last_iter_time = 0.0
         avg_iter_time = 0.0
         iter_count = 0
@@ -1618,10 +1621,12 @@ class Searcher:
 
             max_expansions = 5
             expansions = 0
+            iteration_timed_out = False
             while True:
                 self.order_board = self.root_board.clone()
                 score = self.negamax(board, depth, alpha, beta, 0, True)
                 if self.time_up():
+                    iteration_timed_out = True
                     break
                 if score <= alpha:
                     if expansions >= max_expansions:
@@ -1646,10 +1651,14 @@ class Searcher:
                     expansions += 1
                     continue
                 break
-            if self.time_up():
+            if iteration_timed_out or self.time_up():
+                self.best_move = completed_best_move
                 break
             prev_score, last_score = last_score, score
             prev_iter_best_move = self.best_move
+            completed_best_move = self.best_move
+            completed_score = score
+            completed_pv = self.get_pv(board, depth)
 
             iter_elapsed = max(0.0001, time.time() - iter_start)
             last_iter_time = iter_elapsed
@@ -1676,7 +1685,8 @@ class Searcher:
                 f"info depth {depth} nodes {self.nodes} nps {nps} score {score_str} pv {pv_str}",
                 flush=True,
             )
-        self.root_eval = last_score
+        self.root_eval = completed_score
+        self.best_move = completed_best_move
 
         # Final safety check: ensure reported best move is legal in the current root position.
         legal_root_moves = gen_moves(board)
