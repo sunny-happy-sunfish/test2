@@ -5,7 +5,6 @@ import time
 import random
 import queue
 import threading
-from collections import defaultdict
 
 """
 Simple UCI-compatible chess engine in a single file.
@@ -1546,7 +1545,7 @@ class Searcher:
         self.soft_stop_time = 0
         self.stop = False
         self.best_move = None
-        self.history_heur = defaultdict(int)
+        self.history = [[[0] * 64 for _ in range(64)] for _ in range(2)]
         self.killers = [[None, None] for _ in range(MAX_PLY)]
         self.countermove = {}
         self.age = 0
@@ -1557,7 +1556,7 @@ class Searcher:
 
     def clear(self):
         self.tt = [TTEntry() for _ in range(self.tt_size)]
-        self.history_heur.clear()
+        self.history = [[[0] * 64 for _ in range(64)] for _ in range(2)]
         self.killers = [[None, None] for _ in range(MAX_PLY)]
         self.countermove.clear()
         self.age = 0
@@ -1831,7 +1830,8 @@ class Searcher:
                     score += 800_000
                 elif cm is not None and mt == cm:
                     score += 700_000
-                score += self.history_heur[(board.side_to_move, m.from_sq, m.to_sq)]
+                if m.promo is None:
+                    score += self.history[board.side_to_move][m.from_sq][m.to_sq]
             # Move filtering (ordering): avoid moves that leave pieces en prise when alternatives exist.
             # Only at root, when not in check; heuristic-based. Penalty tries "safe" moves first.
             # SEE-lite: demote captures that can be recaptured by a cheaper piece (bad captures).
@@ -1955,9 +1955,9 @@ class Searcher:
                 best_move = m
             if score > alpha:
                 alpha = score
-                if not m.is_capture():
-                    self.history_heur[(board.side_to_move, m.from_sq, m.to_sq)] += depth * depth
             if alpha >= beta:
+                if not m.is_capture() and m.promo is None:
+                    self.history[board.side_to_move][m.from_sq][m.to_sq] += depth * depth
                 if not m.is_capture():
                     mt = (m.from_sq, m.to_sq, m.promo)
                     if self.killers[ply_idx][0] != mt:
