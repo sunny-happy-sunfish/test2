@@ -1681,7 +1681,7 @@ class Searcher:
             pv = self.get_pv(board, depth)
             pv_str = " ".join(m.uci() for m in pv)
             print(
-                f"info depth {depth} nodes {self.nodes} nps {nps} score {score_str} pv {pv_str}",
+                f"info depth {depth} seldepth {depth} nodes {self.nodes} nps {nps} score {score_str} pv {pv_str}",
                 flush=True,
             )
         self.root_eval = completed_score
